@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes
+import logging
+import threading
 import tkinter as tk
+from typing import Callable
 
 from pynput.keyboard import Key
 
 from untype.platform import CaretPosition, WindowIdentity
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # ctypes structures
@@ -143,3 +148,135 @@ def set_window_noactivate(tk_root: tk.Tk | tk.Toplevel) -> None:
 def get_modifier_key() -> Key:
     """Return the primary modifier key for keyboard shortcuts (Ctrl on Windows)."""
     return Key.ctrl_l
+
+
+# ---------------------------------------------------------------------------
+# Digit key interceptor (low-level keyboard hook)
+# ---------------------------------------------------------------------------
+
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN = 0x0100
+WM_SYSKEYDOWN = 0x0104
+WM_QUIT = 0x0012
+HC_ACTION = 0
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", ctypes.wintypes.DWORD),
+        ("scanCode", ctypes.wintypes.DWORD),
+        ("flags", ctypes.wintypes.DWORD),
+        ("time", ctypes.wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+HOOKPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_long,           # return LRESULT
+    ctypes.c_int,            # nCode
+    ctypes.wintypes.WPARAM,  # wParam
+    ctypes.wintypes.LPARAM,  # lParam
+)
+
+# Separate user32 instance for the digit interceptor so that argtypes
+# set by pynput (which shares ctypes.windll.user32) don't conflict with
+# our HOOKPROC definition.
+_hook_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_hook_user32.SetWindowsHookExW.argtypes = [
+    ctypes.c_int, HOOKPROC, ctypes.wintypes.HINSTANCE, ctypes.wintypes.DWORD,
+]
+_hook_user32.SetWindowsHookExW.restype = ctypes.c_void_p
+_hook_user32.CallNextHookEx.argtypes = [
+    ctypes.c_void_p, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
+]
+_hook_user32.CallNextHookEx.restype = ctypes.c_long
+_hook_user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+_hook_user32.UnhookWindowsHookEx.restype = ctypes.wintypes.BOOL
+
+
+class DigitKeyInterceptor:
+    """Intercept digit keys 1-9 via a ``WH_KEYBOARD_LL`` hook.
+
+    When *active*, key-down events for ``1``–``9`` are suppressed (never
+    reach the target application) and ``on_digit(digit)`` is called.
+    When *inactive*, all keys pass through normally.
+
+    The hook runs on its own daemon thread with a Win32 message pump so
+    that it satisfies the Windows requirement of pumping messages on the
+    thread that installed the hook.
+    """
+
+    def __init__(self, on_digit: Callable[[int], None]) -> None:
+        self._on_digit = on_digit
+        self._active = False
+        self._hook: int | None = None
+        self._thread_id: int | None = None
+        self._thread: threading.Thread | None = None
+        # Must hold a reference to prevent garbage collection of the callback.
+        self._hook_proc = HOOKPROC(self._low_level_handler)
+
+    def start(self) -> None:
+        """Start the hook thread (idempotent)."""
+        if self._thread is not None:
+            return
+        ready = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(ready,),
+            name="untype-digit-hook",
+            daemon=True,
+        )
+        self._thread.start()
+        ready.wait(timeout=5.0)
+
+    def stop(self) -> None:
+        """Post ``WM_QUIT`` to the hook thread's message pump."""
+        tid = self._thread_id
+        if tid is not None:
+            user32.PostThreadMessageW(tid, WM_QUIT, 0, 0)
+            self._thread_id = None
+            self._thread = None
+
+    def set_active(self, active: bool) -> None:
+        self._active = active
+
+    # -- internal ---------------------------------------------------------
+
+    def _low_level_handler(self, nCode: int, wParam: int, lParam: int) -> int:
+        if nCode == HC_ACTION and self._active:
+            kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+            if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                if 0x31 <= kb.vkCode <= 0x39:  # VK_1 .. VK_9
+                    digit = kb.vkCode - 0x30
+                    try:
+                        self._on_digit(digit)
+                    except Exception:
+                        logger.debug(
+                            "on_digit callback error for digit %d", digit,
+                            exc_info=True,
+                        )
+                    return 1  # suppress this key event
+        return _hook_user32.CallNextHookEx(self._hook, nCode, wParam, lParam)
+
+    def _run(self, ready: threading.Event) -> None:
+        """Thread entry: install hook, pump messages, unhook on WM_QUIT."""
+        self._thread_id = kernel32.GetCurrentThreadId()
+        self._hook = _hook_user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL, self._hook_proc, None, 0,
+        )
+        if not self._hook:
+            logger.error("SetWindowsHookExW failed for digit interceptor")
+            ready.set()
+            return
+
+        logger.debug("Digit key interceptor hook installed (thread %d)", self._thread_id)
+        ready.set()
+
+        msg = ctypes.wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+        _hook_user32.UnhookWindowsHookEx(self._hook)
+        self._hook = None
+        logger.debug("Digit key interceptor hook removed")

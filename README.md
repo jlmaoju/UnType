@@ -34,21 +34,25 @@ Most voice input tools give you raw transcription — full of "嗯", "那个", b
   在线 API（OpenAI 兼容）或本地推理（faster-whisper）。自由选择。
 - **System tray UI / 系统托盘界面** — Color-coded status indicator + settings dialog.
   带颜色状态指示的托盘图标 + 设置对话框。
-- **Persona Masks / 人格面具** — Switch LLM personalities with Ctrl+1/2/3 or a click. Define custom tone profiles for different contexts: academic, workplace, casual, bullet-point notes — each with its own prompt, model, and temperature. Drop a JSON file into `~/.untype/personas/` to add a new persona.
-  通过 Ctrl+1/2/3 或点击切换 LLM 人格。为不同场景定义语气配置：学术、职场、日常、要点整理——每个都有独立的提示词、模型和温度。往 `~/.untype/personas/` 放一个 JSON 文件就能新增人格。
+- **Persona Masks / 人格面具** — Pre-select an LLM personality during recording with a single digit key (1-9) or a click. Define custom tone profiles for different contexts: academic, workplace, casual, bullet-point notes — each with its own prompt, model, and temperature. Drop a JSON file into `~/.untype/personas/` to add a new persona. When a persona is pre-selected, the staging area is skipped for a faster workflow.
+  录音时按数字键（1-9）或点击即可预选 LLM 人格。为不同场景定义语气配置：学术、职场、日常、要点整理——每个都有独立的提示词、模型和温度。往 `~/.untype/personas/` 放一个 JSON 文件就能新增人格。预选人格后跳过暂存区，工作流更快。
 
 ## How It Works / 工作原理
 
 ```
 Hold hotkey → Speak → Release hotkey
                 ↓
+   (During recording: persona bar visible,
+    press 1-9 to pre-select a persona)
+                ↓
         [ STT: speech → raw text ]
                 ↓
-        [ Staging area: edit draft + choose persona ]
-                ↓
-        [ LLM: raw text → polished text ]
-                ↓
-        Text appears at your cursor ✓
+   ┌─── Personas configured? ───┐
+   │ YES                        │ NO
+   ↓                            ↓
+[ LLM: with persona ]   [ Staging area: edit ]
+   ↓                            ↓
+Text appears at cursor ✓  [ LLM → cursor ✓ ]
 ```
 
 **Two modes, auto-detected:**
@@ -121,8 +125,8 @@ Drop JSON files into `~/.untype/personas/` to define personas. Each file is one 
 
 - Files are sorted alphabetically — prefix with `01_`, `02_` to control order.
   文件按字母排序——用 `01_`、`02_` 前缀控制顺序。
-- First 3 personas appear in the staging area as clickable buttons (Ctrl+1/2/3).
-  前 3 个人格显示在暂存区，可点击或用 Ctrl+1/2/3 选择。
+- All personas appear as clickable buttons during recording (press 1-9 to pre-select).
+  所有人格在录音时显示为可点击按钮（按 1-9 预选）。
 - Empty fields (`""` or `null`) fall back to global config.
   空字段（`""` 或 `null`）回退到全局配置。
 

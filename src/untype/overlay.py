@@ -128,6 +128,11 @@ class CapsuleOverlay:
         # the args are stashed here and executed when the flight lands.
         self._pending_staging: tuple | None = None
 
+        # Recording persona bar state
+        self._rec_persona_window: tk.Toplevel | None = None
+        self._rec_persona_labels: list[tk.Label] = []
+        self._rec_persona_on_click: Callable[[int], None] | None = None
+
     # ------------------------------------------------------------------
     # Thread-safe public API (callable from any thread)
     # ------------------------------------------------------------------
@@ -211,6 +216,40 @@ class CapsuleOverlay:
         """
         self._staging_event.wait()
         return self._staging_result_text, self._staging_result_action
+
+    # ------------------------------------------------------------------
+    # Recording persona bar (thread-safe public API)
+    # ------------------------------------------------------------------
+
+    def show_recording_personas(
+        self,
+        personas: list[tuple[str, str, str]],
+        x: int,
+        y: int,
+        on_click: Callable[[int], None] | None = None,
+    ) -> None:
+        """Show persona bar near the capsule during recording.
+
+        Persists until :meth:`hide_recording_personas` is called.
+
+        Parameters
+        ----------
+        personas:
+            List of ``(id, icon, name)`` tuples.
+        x, y:
+            Screen position of the capsule (bar appears below it).
+        on_click:
+            Callback ``on_click(index)`` when a persona label is clicked.
+        """
+        self._queue.put(("REC_PERSONAS_SHOW", personas, x, y, on_click))
+
+    def select_recording_persona(self, index: int) -> None:
+        """Highlight the persona at *index* as pre-selected (-1 to clear)."""
+        self._queue.put(("REC_PERSONAS_SELECT", index))
+
+    def hide_recording_personas(self) -> None:
+        """Hide the recording persona bar."""
+        self._queue.put(("REC_PERSONAS_HIDE",))
 
     # ------------------------------------------------------------------
     # Overlay thread internals
@@ -316,6 +355,14 @@ class CapsuleOverlay:
         elif op == "STAGING_SHOW":
             _, text, x, y, at_corner, personas = cmd
             self._do_show_staging(text, x, y, at_corner, personas)
+        elif op == "REC_PERSONAS_SHOW":
+            _, personas, x, y, on_click = cmd
+            self._do_show_recording_personas(personas, x, y, on_click)
+        elif op == "REC_PERSONAS_SELECT":
+            _, index = cmd
+            self._do_select_recording_persona(index)
+        elif op == "REC_PERSONAS_HIDE":
+            self._do_hide_recording_personas()
         elif op == "QUIT":
             self._do_quit()
 
@@ -392,6 +439,7 @@ class CapsuleOverlay:
         if root is not None:
             self._do_hide_hold_bubble()
             self._do_hide_staging()
+            self._do_hide_recording_personas()
             # Unblock any pipeline thread waiting on staging.
             self._staging_result_action = "cancel"
             self._staging_event.set()
@@ -473,11 +521,20 @@ class CapsuleOverlay:
         cy = self._fly_start_y + (self._fly_end_y - self._fly_start_y) * t
         win.geometry(f"+{int(cx)}+{int(cy)}")
 
+        # Move recording persona bar in sync with the capsule.
+        if self._rec_persona_window is not None:
+            self._rec_persona_window.geometry(
+                f"+{int(cx)}+{int(cy) + _CAPSULE_H + 4}"
+            )
+
         # Gentle alpha fade during the second half of the flight.
         if raw_t > 0.5:
             fade_t = (raw_t - 0.5) / 0.5
             alpha = _CAPSULE_ALPHA_MAX - fade_t * 0.25
             win.attributes("-alpha", alpha)
+            # Fade persona bar in sync.
+            if self._rec_persona_window is not None:
+                self._rec_persona_window.attributes("-alpha", 0.9 - fade_t * 0.25)
 
         if raw_t >= 1.0:
             # Flight complete.
@@ -509,6 +566,10 @@ class CapsuleOverlay:
                 # No result yet — park here, keep breathing.
                 self._capsule_at_corner = True
                 win.attributes("-alpha", _CAPSULE_ALPHA_MAX)
+                # Restore persona bar alpha after flight fade.
+                if self._rec_persona_window is not None:
+                    self._rec_persona_window.attributes("-alpha", 0.9)
+                    self._rec_persona_window.lift()
             return
 
         root.after(_FLY_FRAME_MS, self._animate_fly)
@@ -632,6 +693,128 @@ class CapsuleOverlay:
                 name="untype-hold-copy",
                 daemon=True,
             ).start()
+
+    # ------------------------------------------------------------------
+    # Recording persona bar (overlay thread only)
+    # ------------------------------------------------------------------
+
+    def _do_show_recording_personas(
+        self,
+        personas: list[tuple[str, str, str]],
+        x: int,
+        y: int,
+        on_click: Callable[[int], None] | None,
+    ) -> None:
+        """Create and show the recording persona bar below the capsule."""
+        root = self._root
+        if root is None:
+            return
+
+        # Destroy any existing persona bar.
+        self._do_hide_recording_personas()
+
+        win = tk.Toplevel(root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.attributes("-alpha", 0.9)
+
+        try:
+            set_window_noactivate(win)
+        except Exception:
+            logger.debug("set_window_noactivate failed on recording persona bar")
+
+        frame = tk.Frame(win, bg="#2a2a2a")
+        frame.pack(fill="both", expand=True)
+
+        labels: list[tk.Label] = []
+        for idx, (_pid, icon, name) in enumerate(personas):
+            digit = idx + 1
+            lbl = tk.Label(
+                frame,
+                text=f" {digit} {icon} {name} ",
+                font=("Segoe UI", 9),
+                bg="#2a2a2a",
+                fg="#888888",
+                cursor="hand2",
+                padx=2,
+                pady=2,
+            )
+            lbl.pack(side="left", padx=(0, 4))
+
+            # Click binding.
+            if on_click is not None:
+                lbl.bind(
+                    "<Button-1>",
+                    lambda e, i=idx: self._on_rec_persona_label_click(i),
+                )
+
+            # Hover effects (only when not selected).
+            lbl.bind(
+                "<Enter>",
+                lambda e, w=lbl: (
+                    w.configure(fg="#cccccc")
+                    if w.cget("bg") != "#4a4a8a"
+                    else None
+                ),
+            )
+            lbl.bind(
+                "<Leave>",
+                lambda e, w=lbl: (
+                    w.configure(fg="#888888")
+                    if w.cget("bg") != "#4a4a8a"
+                    else None
+                ),
+            )
+
+            labels.append(lbl)
+
+        self._rec_persona_labels = labels
+        self._rec_persona_on_click = on_click
+        self._rec_persona_window = win
+
+        # Position below the capsule.  The capsule's top-left is placed by
+        # _do_show at (x + 12, y - _CAPSULE_H - 8).
+        capsule_x = x + 12
+        capsule_y = y - _CAPSULE_H - 8
+
+        # Keep on-screen (same logic as _do_show).
+        screen_w = win.winfo_screenwidth()
+        if capsule_x + _CAPSULE_W > screen_w:
+            capsule_x = x - _CAPSULE_W - 12
+        if capsule_y < 0:
+            capsule_y = y + 24
+
+        bar_x = capsule_x
+        bar_y = capsule_y + _CAPSULE_H + 4
+
+        win.geometry(f"+{bar_x}+{bar_y}")
+        win.deiconify()
+        win.lift()
+
+    def _on_rec_persona_label_click(self, index: int) -> None:
+        """Handle click on a recording persona label."""
+        cb = self._rec_persona_on_click
+        if cb is not None:
+            cb(index)
+
+    def _do_select_recording_persona(self, index: int) -> None:
+        """Highlight the persona at *index* (-1 to clear all)."""
+        for i, lbl in enumerate(self._rec_persona_labels):
+            if i == index:
+                lbl.configure(bg="#4a4a8a", fg="#ffffff")
+            else:
+                lbl.configure(bg="#2a2a2a", fg="#888888")
+
+    def _do_hide_recording_personas(self) -> None:
+        """Destroy the recording persona bar window."""
+        if self._rec_persona_window is not None:
+            try:
+                self._rec_persona_window.destroy()
+            except Exception:
+                pass
+            self._rec_persona_window = None
+            self._rec_persona_labels = []
+            self._rec_persona_on_click = None
 
     # ------------------------------------------------------------------
     # Staging area (Phase 3)

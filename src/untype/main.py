@@ -53,6 +53,7 @@ class UnTypeApp:
         self._mode: str = "insert"  # "polish" or "insert"
         self._selected_text: str | None = None
         self._original_clipboard: str | None = None
+        self._preselected_persona: Persona | None = None
 
         # -- HWND safety (Phase 2) --------------------------------------------
         self._target_window: WindowIdentity | None = None
@@ -101,6 +102,13 @@ class UnTypeApp:
             on_hold_copy=self._on_hold_copy,
         )
 
+        logger.info("Initialising digit key interceptor...")
+        from untype._platform_win32 import DigitKeyInterceptor
+
+        self._digit_interceptor = DigitKeyInterceptor(
+            on_digit=self._on_digit_during_recording,
+        )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -113,6 +121,7 @@ class UnTypeApp:
         """
         self._hotkey.start()
         self._overlay.start()
+        self._digit_interceptor.start()
         logger.info("UnType is ready.  Hold %s to speak.", self._config.hotkey.trigger)
         self._tray.update_status("Ready")
 
@@ -211,6 +220,18 @@ class UnTypeApp:
             self._tray.update_status("Recording...")
             self._overlay.show(self._caret_x, self._caret_y, "Recording...")
 
+            # Show recording persona bar (if personas configured).
+            self._preselected_persona = None
+            if self._personas:
+                persona_tuples = [(p.id, p.icon, p.name) for p in self._personas]
+                self._overlay.show_recording_personas(
+                    persona_tuples,
+                    self._caret_x,
+                    self._caret_y,
+                    on_click=self._on_rec_persona_click,
+                )
+                self._digit_interceptor.set_active(True)
+
             # Grab selected text to determine the interaction mode.
             # This happens while recording is already running.
             logger.info("Grabbing selected text...")
@@ -245,6 +266,8 @@ class UnTypeApp:
 
             if not self._recorder.is_recording:
                 logger.warning("Recording not active — aborting pipeline")
+                self._digit_interceptor.set_active(False)
+                self._overlay.hide_recording_personas()
                 self._tray.update_status("Ready")
                 self._overlay.hide()
                 return
@@ -255,6 +278,8 @@ class UnTypeApp:
 
             if audio.size == 0:
                 logger.warning("Empty audio buffer — aborting pipeline")
+                self._digit_interceptor.set_active(False)
+                self._overlay.hide_recording_personas()
                 self._tray.update_status("Ready")
                 self._overlay.hide()
                 return
@@ -272,101 +297,38 @@ class UnTypeApp:
 
             if not text:
                 logger.warning("Empty transcription — aborting pipeline")
+                self._digit_interceptor.set_active(False)
+                self._overlay.hide_recording_personas()
                 self._tray.update_status("Ready")
                 self._overlay.hide()
                 return
 
             logger.info("Transcription: %s", text)
 
-            # 4. Stop HWND watcher and show staging area.
-            self._hwnd_watch_active = False
-            at_corner = self._window_mismatch
-            self._tray.update_status("Ready")
+            # 4. STT complete — deactivate digit interceptor and hide persona bar.
+            self._digit_interceptor.set_active(False)
+            self._overlay.hide_recording_personas()
 
-            persona_tuples = [(p.id, p.icon, p.name) for p in self._personas]
-
-            if at_corner:
-                self._overlay.show_staging(
-                    text, 0, 0, at_corner=True,
-                    personas=persona_tuples or None,
-                )
+            # 5. Branch: personas configured → skip staging; otherwise → staging.
+            if self._personas:
+                self._process_with_personas(text)
             else:
-                self._overlay.show_staging(
-                    text, self._caret_x, self._caret_y,
-                    personas=persona_tuples or None,
-                )
-
-            # 5. Block until the user acts (Enter / Shift+Enter / Esc).
-            edited_text, action = self._overlay.wait_staging()
-
-            if action == "cancel":
-                logger.info("Staging cancelled by user")
-                return
-
-            # Brief delay for focus to return to the previous window.
-            time.sleep(0.15)
-
-            if action == "raw":
-                # Inject raw text directly (bypass LLM).
-                logger.info("Injecting raw text (%d chars)", len(edited_text))
-                inject_text(edited_text, self._original_clipboard)
-                return
-
-            # 6. action == "refine" or "persona:<id>" — send through LLM.
-            # Do NOT re-capture target window here — keep the original one
-            # from hotkey-press time so HWND safety works correctly even if
-            # the user switched windows while the staging area was open.
-            caret = get_caret_screen_position()
-            self._overlay.show(caret.x, caret.y, "Processing...")
-            self._tray.update_status("Processing...")
-
-            # Restart HWND monitoring during the LLM call so that window
-            # switches are caught both before and during LLM processing.
-            self._start_hwnd_watcher()
-
-            # Determine persona (if any).
-            persona: Persona | None = None
-            if action.startswith("persona:"):
-                persona_id = action.split(":", 1)[1]
-                persona = next(
-                    (p for p in self._personas if p.id == persona_id), None,
-                )
-
-            result = self._run_llm(edited_text, persona=persona)
-
-            # 7. Stop watcher and verify window before injection.
-            self._hwnd_watch_active = False
-            if self._target_window is not None and (
-                self._window_mismatch
-                or not verify_foreground_window(self._target_window)
-            ):
-                logger.warning(
-                    "Window changed during LLM processing — holding result",
-                )
-                self._held_result = result
-                self._held_clipboard = self._original_clipboard
-                self._overlay.fly_to_hold_bubble(result)
-                self._tray.update_status("Ready")
-                return
-
-            # 8. Inject refined result.
-            logger.info("Injecting refined text (%d chars)", len(result))
-            inject_text(result, self._original_clipboard)
-            self._overlay.hide()
-            self._tray.update_status("Ready")
-            logger.info("Pipeline complete")
+                self._process_with_staging(text)
 
         except Exception:
             logger.exception("Pipeline error")
             self._hwnd_watch_active = False
+            self._digit_interceptor.set_active(False)
             self._tray.update_status("Error")
             self._overlay.update_status("Error")
             # Briefly show the error status, then revert to Ready.
             time.sleep(2)
             self._tray.update_status("Ready")
             self._overlay.hide()
+            self._overlay.hide_recording_personas()
         finally:
             self._hwnd_watch_active = False
+            self._digit_interceptor.set_active(False)
             self._pipeline_lock.release()
 
     def _run_llm(self, transcribed_text: str, persona: Persona | None = None) -> str:
@@ -405,6 +367,114 @@ class UnTypeApp:
         except Exception:
             logger.exception("LLM request failed — falling back to raw transcription")
             return transcribed_text
+
+    def _process_with_personas(self, text: str) -> None:
+        """Fast-lane: skip staging, go directly to LLM (with optional persona).
+
+        Called when personas are configured.  The user may have pre-selected
+        a persona via digit keys during recording/STT.
+        """
+        persona = self._preselected_persona
+        self._preselected_persona = None
+
+        if persona:
+            logger.info("Using pre-selected persona: %s", persona.name)
+        else:
+            logger.info("No persona pre-selected — using default LLM processing")
+
+        self._hwnd_watch_active = False
+        at_corner = self._window_mismatch
+
+        caret = get_caret_screen_position()
+        cx = caret.x if not at_corner else 0
+        cy = caret.y if not at_corner else 0
+        self._overlay.show(cx, cy, "Processing...")
+        self._tray.update_status("Processing...")
+
+        # Restart HWND monitoring during the LLM call.
+        self._start_hwnd_watcher()
+
+        result = self._run_llm(text, persona=persona)
+
+        # Stop watcher and verify window before injection.
+        self._hwnd_watch_active = False
+        if self._target_window is not None and (
+            self._window_mismatch
+            or not verify_foreground_window(self._target_window)
+        ):
+            logger.warning(
+                "Window changed during LLM processing — holding result",
+            )
+            self._held_result = result
+            self._held_clipboard = self._original_clipboard
+            self._overlay.fly_to_hold_bubble(result)
+            self._tray.update_status("Ready")
+            return
+
+        logger.info("Injecting refined text (%d chars)", len(result))
+        inject_text(result, self._original_clipboard)
+        self._overlay.hide()
+        self._tray.update_status("Ready")
+        logger.info("Pipeline complete (fast-lane)")
+
+    def _process_with_staging(self, text: str) -> None:
+        """Show staging area for manual editing (no personas configured)."""
+        self._hwnd_watch_active = False
+        at_corner = self._window_mismatch
+        self._tray.update_status("Ready")
+
+        if at_corner:
+            self._overlay.show_staging(text, 0, 0, at_corner=True)
+        else:
+            self._overlay.show_staging(
+                text, self._caret_x, self._caret_y,
+            )
+
+        # Block until the user acts (Enter / Shift+Enter / Esc).
+        edited_text, action = self._overlay.wait_staging()
+
+        if action == "cancel":
+            logger.info("Staging cancelled by user")
+            return
+
+        # Brief delay for focus to return to the previous window.
+        time.sleep(0.15)
+
+        if action == "raw":
+            logger.info("Injecting raw text (%d chars)", len(edited_text))
+            inject_text(edited_text, self._original_clipboard)
+            return
+
+        # action == "refine" — send through LLM.
+        caret = get_caret_screen_position()
+        self._overlay.show(caret.x, caret.y, "Processing...")
+        self._tray.update_status("Processing...")
+
+        # Restart HWND monitoring during the LLM call.
+        self._start_hwnd_watcher()
+
+        result = self._run_llm(edited_text)
+
+        # Stop watcher and verify window before injection.
+        self._hwnd_watch_active = False
+        if self._target_window is not None and (
+            self._window_mismatch
+            or not verify_foreground_window(self._target_window)
+        ):
+            logger.warning(
+                "Window changed during LLM processing — holding result",
+            )
+            self._held_result = result
+            self._held_clipboard = self._original_clipboard
+            self._overlay.fly_to_hold_bubble(result)
+            self._tray.update_status("Ready")
+            return
+
+        logger.info("Injecting refined text (%d chars)", len(result))
+        inject_text(result, self._original_clipboard)
+        self._overlay.hide()
+        self._tray.update_status("Ready")
+        logger.info("Pipeline complete")
 
     # ------------------------------------------------------------------
     # HWND watcher (Phase 2 — polls foreground window during pipeline)
@@ -470,6 +540,26 @@ class UnTypeApp:
             pyperclip.copy(result)
         except Exception:
             logger.exception("Failed to copy held result to clipboard")
+
+    # ------------------------------------------------------------------
+    # Recording persona callbacks
+    # ------------------------------------------------------------------
+
+    def _on_digit_during_recording(self, digit: int) -> None:
+        """Called from the keyboard hook thread when a digit key is pressed."""
+        idx = digit - 1
+        if idx < len(self._personas):
+            if self._preselected_persona == self._personas[idx]:
+                # Toggle off: pressing the same digit again deselects.
+                self._preselected_persona = None
+                self._overlay.select_recording_persona(-1)
+            else:
+                self._preselected_persona = self._personas[idx]
+                self._overlay.select_recording_persona(idx)
+
+    def _on_rec_persona_click(self, index: int) -> None:
+        """Called from overlay thread when a recording persona button is clicked."""
+        self._on_digit_during_recording(index + 1)
 
     # ------------------------------------------------------------------
     # Settings hot-reload
@@ -554,6 +644,7 @@ class UnTypeApp:
         """Handle the Quit action from the tray menu."""
         logger.info("Shutting down...")
         self._hotkey.stop()
+        self._digit_interceptor.stop()
         self._overlay.stop()
         if self._llm is not None:
             self._llm.close()
