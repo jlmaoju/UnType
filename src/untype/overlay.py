@@ -132,6 +132,7 @@ class CapsuleOverlay:
         self._rec_persona_window: tk.Toplevel | None = None
         self._rec_persona_labels: list[tk.Label] = []
         self._rec_persona_on_click: Callable[[int], None] | None = None
+        self._rec_persona_bar_w: int = 0  # measured width for right-alignment
 
     # ------------------------------------------------------------------
     # Thread-safe public API (callable from any thread)
@@ -521,10 +522,11 @@ class CapsuleOverlay:
         cy = self._fly_start_y + (self._fly_end_y - self._fly_start_y) * t
         win.geometry(f"+{int(cx)}+{int(cy)}")
 
-        # Move recording persona bar in sync with the capsule.
+        # Move recording persona bar in sync with the capsule (right-aligned).
         if self._rec_persona_window is not None:
+            bar_x = int(cx) + _CAPSULE_W - self._rec_persona_bar_w
             self._rec_persona_window.geometry(
-                f"+{int(cx)}+{int(cy) + _CAPSULE_H + 4}"
+                f"+{bar_x}+{int(cy) + _CAPSULE_H + 4}"
             )
 
         # Gentle alpha fade during the second half of the flight.
@@ -784,8 +786,15 @@ class CapsuleOverlay:
         if capsule_y < 0:
             capsule_y = y + 24
 
-        bar_x = capsule_x
         bar_y = capsule_y + _CAPSULE_H + 4
+
+        # Right-align the bar to the capsule's right edge so it doesn't
+        # extend off-screen when the capsule is near the right margin.
+        win.update_idletasks()
+        bar_w = win.winfo_reqwidth()
+        self._rec_persona_bar_w = bar_w
+        capsule_right = capsule_x + _CAPSULE_W
+        bar_x = capsule_right - bar_w
 
         win.geometry(f"+{bar_x}+{bar_y}")
         win.deiconify()
@@ -815,6 +824,7 @@ class CapsuleOverlay:
             self._rec_persona_window = None
             self._rec_persona_labels = []
             self._rec_persona_on_click = None
+            self._rec_persona_bar_w = 0
 
     # ------------------------------------------------------------------
     # Staging area (Phase 3)
