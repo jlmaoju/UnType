@@ -98,24 +98,30 @@ Settings are stored in `~/.untype/config.toml` (created on first launch):
 
 ### Personas
 
-Drop JSON files into `personas/` to define personas. Each file is one persona:
+Personas let the AI process your speech in different "roles". Pre-select a persona during recording by pressing a digit key (1-9) or clicking, then skip the staging area and go straight to the LLM.
 
-```json
-{
-  "id": "academic",
-  "name": "Academic",
-  "icon": "📚",
-  "prompt_polish": "",
-  "prompt_insert": "You are an academic writing assistant...",
-  "model": "",
-  "temperature": 0.2,
-  "max_tokens": null
-}
-```
+**Built-in Personas:**
 
-- Files are sorted alphabetically — prefix with `01_`, `02_` to control order.
-- All personas appear as clickable buttons during recording (press 1-9 to pre-select).
-- Empty fields (`""` or `null`) fall back to global config.
+| Icon | Name | Use Case |
+|------|------|----------|
+| 👔 | To Boss | Formal, tactful workplace communication |
+| 🤝 | To Colleague | Friendly yet professional daily exchange |
+| 📋 | Bullet Points | Auto-organize into a concise list |
+| 🌐 | English | Chinese speech → English output |
+| 🗣️ | Plain Talk | Make complex ideas simple |
+| 🙅 | Decline | Politely turn down requests |
+
+**Management:**
+
+Right-click the tray icon → **Personas...** to open the graphical interface:
+- Create, edit, and delete personas
+- Import/export JSON files (easy to share)
+- Open the personas folder for direct file management
+
+Each persona can customize:
+- Insert mode prompt
+- Polish mode prompt
+- Independent model, temperature, and max tokens
 
 ## Development
 
