@@ -1,6 +1,6 @@
 [project]
 name = "untype"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI-powered voice input for Windows — STT + LLM, from speech to polished text"
 readme = "README.md"
 license = "GPL-3.0-or-later"
@@ -32,10 +32,18 @@ dependencies = [
     "Pillow>=10.0.0",
     "tomli>=2.0.0;python_version<'3.11'",
     "tomli-w>=1.0.0",
+    "dashscope>=1.20.0",
 ]
 
 [project.scripts]
 untype = "untype.main:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.8.0",
+    "pyinstaller>=6.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/jlmaoju/untype"

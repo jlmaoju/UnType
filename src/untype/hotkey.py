@@ -169,6 +169,11 @@ class HotkeyListener:
         """Stop the hotkey listener and reset state."""
         if self._listener is not None:
             self._listener.stop()
+            # Wait for the listener thread to actually stop.
+            # pynput.Listener uses a private _thread attribute.
+            thread = getattr(self._listener, "_thread", None)
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=1.0)
             self._listener = None
             logger.info("Hotkey listener stopped")
         with self._lock:

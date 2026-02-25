@@ -102,7 +102,7 @@ class SettingsDialog:
 
         # -- Hotkey -------------------------------------------------------
         row = self._heading(frame, t("settings.heading.hotkey"), row)
-        hotkey_var = self._text_field(
+        hotkey_var = self._hotkey_field(
             root,
             frame,
             t("settings.trigger"),
@@ -154,8 +154,45 @@ class SettingsDialog:
 
         # -- STT -----------------------------------------------------------
         row = self._heading(frame, t("settings.heading.stt"), row)
-        stt_backend_options = ["api", "local"]
-        stt_backend_labels = [t("settings.backend.api"), t("settings.backend.local")]
+        stt_backend_options = ["api", "local", "realtime_api"]
+        stt_backend_labels = [
+            t("settings.backend.api"),
+            t("settings.backend.local"),
+            t("settings.backend.realtime_api"),
+        ]
+
+        # Store field label widgets for show/hide (labels and their input widgets)
+        stt_field_labels: dict[str, tuple[ttk.Label, tk.Widget]] = {}
+
+        def _on_stt_backend_change(backend: str) -> None:
+            """Show/hide STT fields based on backend selection."""
+            # api fields: stt_api_url, stt_api_key, stt_api_model
+            # local fields: stt_model (model_size), stt_device
+            # realtime_api fields: stt_realtime_api_key, stt_realtime_api_model
+            api_fields = [
+                t("settings.stt_api_url"),
+                t("settings.stt_api_key"),
+                t("settings.stt_api_model"),
+            ]
+            local_fields = [t("settings.local_model"), t("settings.local_device")]
+            realtime_fields = [
+                t("settings.stt_realtime_api_key"),
+                t("settings.stt_realtime_api_model"),
+            ]
+
+            for label_text, (label_widget, input_widget) in stt_field_labels.items():
+                should_show = (
+                    (label_text in api_fields and backend == "api") or
+                    (label_text in local_fields and backend == "local") or
+                    (label_text in realtime_fields and backend == "realtime_api")
+                )
+                if should_show:
+                    label_widget.grid()
+                    input_widget.grid()
+                else:
+                    label_widget.grid_remove()
+                    input_widget.grid_remove()
+
         stt_backend_var = self._combo_field(
             root,
             frame,
@@ -164,51 +201,86 @@ class SettingsDialog:
             stt_backend_options,
             row,
             labels=stt_backend_labels,
+            on_change=_on_stt_backend_change,
         )
         row += 1
-        stt_api_url_var = self._text_field(
-            root,
-            frame,
+
+        # Helper to create field and track its widgets
+        def _create_text_field(label: str, value: str, show: str = "") -> tk.StringVar:
+            ttk.Label(frame, text=label).grid(
+                row=row, column=0, sticky="w", padx=(0, 8), pady=2
+            )
+            var = tk.StringVar(master=root, value=value)
+            entry = ttk.Entry(frame, textvariable=var, width=48)
+            if show:
+                entry.configure(show=show)
+            entry.grid(row=row, column=1, sticky="ew", pady=2)
+            # Store label and entry for show/hide
+            stt_field_labels[label] = (
+                frame.grid_slaves(row=row, column=0)[0],
+                frame.grid_slaves(row=row, column=1)[0],
+            )
+            return var
+
+        def _create_combo_field(label: str, value: str, options: list[str]) -> tk.StringVar:
+            ttk.Label(frame, text=label).grid(
+                row=row, column=0, sticky="w", padx=(0, 8), pady=2
+            )
+            var = tk.StringVar(master=root, value=value)
+            combo = ttk.Combobox(
+                frame, textvariable=var, values=options, width=45, state="readonly"
+            )
+            combo.grid(row=row, column=1, sticky="ew", pady=2)
+            # Store label and combo for show/hide
+            stt_field_labels[label] = (
+                frame.grid_slaves(row=row, column=0)[0],
+                frame.grid_slaves(row=row, column=1)[0],
+            )
+            return var
+
+        stt_api_url_var = _create_text_field(
             t("settings.stt_api_url"),
             self._config.stt.api_base_url,
-            row,
         )
         row += 1
-        stt_api_key_var = self._text_field(
-            root,
-            frame,
+        stt_api_key_var = _create_text_field(
             t("settings.stt_api_key"),
             self._config.stt.api_key,
-            row,
             show="*",
         )
         row += 1
-        stt_api_model_var = self._text_field(
-            root,
-            frame,
+        stt_api_model_var = _create_text_field(
             t("settings.stt_api_model"),
             self._config.stt.api_model,
-            row,
         )
         row += 1
-        stt_model_var = self._combo_field(
-            root,
-            frame,
+        stt_model_var = _create_combo_field(
             t("settings.local_model"),
             self._config.stt.model_size,
             ["small", "medium", "large-v3"],
-            row,
         )
         row += 1
-        stt_device_var = self._combo_field(
-            root,
-            frame,
+        stt_device_var = _create_combo_field(
             t("settings.local_device"),
             self._config.stt.device,
             ["auto", "cuda", "cpu"],
-            row,
         )
         row += 1
+        # Realtime API fields (Aliyun DashScope)
+        stt_realtime_api_key_var = _create_text_field(
+            t("settings.stt_realtime_api_key"),
+            self._config.stt.realtime_api_key,
+            show="*",
+        )
+        row += 1
+        stt_realtime_api_model_var = _create_text_field(
+            t("settings.stt_realtime_api_model"),
+            self._config.stt.realtime_api_model,
+        )
+        row += 1
+
+        # Initial show/hide based on current backend
+        _on_stt_backend_change(self._config.stt.backend)
 
         # -- Audio ---------------------------------------------------------
         row = self._heading(frame, t("settings.heading.audio"), row)
@@ -223,17 +295,16 @@ class SettingsDialog:
 
         # -- Overlay -------------------------------------------------------
         row = self._heading(frame, t("settings.heading.overlay"), row)
-        capsule_pos_options = ["caret", "bottom_center", "bottom_left"]
+        capsule_pos_options = ["fixed", "caret"]
         capsule_pos_labels = [
+            t("settings.capsule_position.fixed"),
             t("settings.capsule_position.caret"),
-            t("settings.capsule_position.bottom_center"),
-            t("settings.capsule_position.bottom_left"),
         ]
         capsule_pos_var = self._combo_field(
             root,
             frame,
             t("settings.capsule_position"),
-            self._config.overlay.capsule_position,
+            self._config.overlay.capsule_position_mode,
             capsule_pos_options,
             row,
             labels=capsule_pos_labels,
@@ -278,6 +349,8 @@ class SettingsDialog:
                 stt_api_model_var=stt_api_model_var,
                 stt_model_var=stt_model_var,
                 stt_device_var=stt_device_var,
+                stt_realtime_api_key_var=stt_realtime_api_key_var,
+                stt_realtime_api_model_var=stt_realtime_api_model_var,
                 gain_var=gain_var,
                 capsule_pos_var=capsule_pos_var,
                 lang_var=lang_var,
@@ -332,6 +405,7 @@ class SettingsDialog:
         options: list[str],
         row: int,
         labels: list[str] | None = None,
+        on_change: Callable[[str], None] | None = None,
     ) -> tk.StringVar:
         """Add a labelled dropdown and return the associated StringVar.
 
@@ -344,6 +418,7 @@ class SettingsDialog:
             row: Grid row.
             labels: Optional display labels for options (same order as ``options``).
                     If provided, the dropdown shows labels but stores the option value.
+            on_change: Optional callback when selection changes, receives new value.
         """
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
         var = tk.StringVar(master=master, value=value)
@@ -367,10 +442,13 @@ class SettingsDialog:
             )
             combo.grid(row=row, column=1, sticky="ew", pady=2)
 
-            # When selection changes, update the internal var
+            # When selection changes, update the internal var and call callback
             def _on_select(_event: tk.Event) -> None:  # type: ignore[type-arg]
                 selected_label = display_var.get()
-                var.set(label_to_value.get(selected_label, selected_label))
+                new_value = label_to_value.get(selected_label, selected_label)
+                var.set(new_value)
+                if on_change:
+                    on_change(new_value)
 
             combo.bind("<<ComboboxSelected>>", _on_select)
         else:
@@ -378,6 +456,12 @@ class SettingsDialog:
                 parent, textvariable=var, values=options, width=45, state="readonly"
             )
             combo.grid(row=row, column=1, sticky="ew", pady=2)
+
+            if on_change:
+                def _on_select_simple(_event: tk.Event) -> None:  # type: ignore[type-arg]
+                    if on_change:
+                        on_change(var.get())
+                combo.bind("<<ComboboxSelected>>", _on_select_simple)
 
         return var
 
@@ -400,6 +484,161 @@ class SettingsDialog:
         )
         return var
 
+    # Hotkeys that should be blocked because they conflict with system or app functions
+    _BLOCKED_HOTKEYS = {
+        "ctrl+c",    # Copy - conflicts with app's own clipboard operations
+        "ctrl+v",    # Paste
+        "ctrl+x",    # Cut
+        "ctrl+z",    # Undo
+        "ctrl+y",    # Redo
+        "ctrl+a",    # Select all
+        "ctrl+s",    # Save
+        "ctrl+w",    # Close window
+        "ctrl+q",    # Quit
+        "ctrl+n",    # New
+        "ctrl+o",    # Open
+        "alt+f4",    # Close app
+        "alt+tab",   # Switch window
+        "win+l",     # Lock computer
+        "escape",    # System key
+    }
+
+    @staticmethod
+    def _hotkey_field(
+        master: tk.Tk,
+        parent: ttk.Frame,
+        label: str,
+        value: str,
+        row: int,
+    ) -> tk.StringVar:
+        """Add a hotkey input field with recording capability.
+
+        Click the input field and press a key (or key combo) to record it.
+        """
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+        var = tk.StringVar(master=master, value=value)
+
+        entry = ttk.Entry(parent, textvariable=var, width=48)
+        entry.grid(row=row, column=1, sticky="ew", pady=2)
+
+        # Warning label for blocked hotkeys
+        warning_var = tk.StringVar(master=master, value="")
+        warning_label = ttk.Label(
+            parent,
+            textvariable=warning_var,
+            foreground="red",
+            font=("TkDefaultFont", 9),
+        )
+        warning_label.grid(row=row + 1, column=1, sticky="w", pady=(0, 2))
+
+        # Track recording state
+        recording_state = {"active": False}
+
+        def format_key_event(event: tk.Event) -> str:  # type: ignore[type-arg]
+            """Convert a key event to a hotkey string."""
+            # Build modifiers
+            mods = []
+            if event.state & 0x0001:  # Shift
+                mods.append("shift")
+            if event.state & 0x0002:  # Caps Lock (ignore)
+                pass
+            if event.state & 0x0004:  # Control
+                mods.append("ctrl")
+            if event.state & 0x0008:  # Alt
+                mods.append("alt")
+
+            # Get the key name
+            keysym = event.keysym.lower()
+
+            # Normalize key names
+            key_map = {
+                "control_l": "ctrl",
+                "control_r": "ctrl",
+                "shift_l": "shift",
+                "shift_r": "shift",
+                "alt_l": "alt",
+                "alt_r": "alt",
+                "win_l": "win",
+                "win_r": "win",
+                "super_l": "win",
+                "super_r": "win",
+                "space": "space",
+                "return": "enter",
+                "escape": "esc",
+                "backspace": "backspace",
+                "tab": "tab",
+                "prior": "page_up",
+                "next": "page_down",
+                "home": "home",
+                "end": "end",
+                "insert": "insert",
+                "delete": "delete",
+            }
+
+            # Skip modifier-only presses
+            if keysym in ("shift_l", "shift_r", "control_l", "control_r",
+                          "alt_l", "alt_r", "win_l", "win_r"):
+                return ""
+
+            key = key_map.get(keysym, keysym)
+
+            # Handle function keys
+            if keysym.startswith("f") and keysym[1:].isdigit():
+                key = keysym
+
+            # Build final string
+            if mods:
+                return "+".join(mods + [key])
+            return key
+
+        def on_focus_in(_event: tk.Event) -> None:  # type: ignore[type-arg]
+            recording_state["active"] = True
+            entry.configure(style="Recording.TEntry")
+
+        def on_focus_out(_event: tk.Event) -> None:  # type: ignore[type-arg]
+            recording_state["active"] = False
+            entry.configure(style="TEntry")
+
+        def on_key_press(event: tk.Event) -> str:  # type: ignore[type-arg]
+            if not recording_state["active"]:
+                return ""
+            hotkey = format_key_event(event)
+            if hotkey:
+                # Check if hotkey is blocked
+                if hotkey.lower() in SettingsDialog._BLOCKED_HOTKEYS:
+                    import tkinter.messagebox as messagebox
+
+                    title = t("settings.error.invalid_hotkey") if hasattr(t, "_dict") and "settings.error.invalid_hotkey" in t._dict else "Invalid Hotkey"  # noqa: E501
+                    msg = (
+                        f"{hotkey} cannot be used as it conflicts with "
+                        "system or application functions.\n\n"
+                        "Please choose a different hotkey (e.g., f6, f7, ctrl+space)."
+                    )
+                    messagebox.showwarning(title, msg)
+                    return "break"
+                var.set(hotkey)
+                warning_var.set("")
+            return "break"  # Prevent default handling
+
+        # Create style for recording state
+        style = ttk.Style()
+        style.configure("Recording.TEntry", fieldbackground="#e6f3ff")
+
+        entry.bind("<FocusIn>", on_focus_in)
+        entry.bind("<FocusOut>", on_focus_out)
+        entry.bind("<KeyPress>", on_key_press)
+
+        # Add hint text
+        hint = ttk.Label(
+            parent,
+            text=t("settings.hotkey_hint"),
+            font=("TkDefaultFont", 8),
+            foreground="gray",
+        )
+        hint.grid(row=row + 1, column=1, sticky="w", pady=(0, 2))
+
+        return var
+
     # ------------------------------------------------------------------ #
 
     def _do_save(
@@ -417,6 +656,8 @@ class SettingsDialog:
         stt_api_model_var: tk.StringVar,
         stt_model_var: tk.StringVar,
         stt_device_var: tk.StringVar,
+        stt_realtime_api_key_var: tk.StringVar,
+        stt_realtime_api_model_var: tk.StringVar,
         gain_var: tk.DoubleVar,
         capsule_pos_var: tk.StringVar,
         lang_var: tk.StringVar,
@@ -428,6 +669,17 @@ class SettingsDialog:
             gain_value = gain_var.get()
         except Exception:
             messagebox.showerror(t("settings.error.invalid_gain"), t("settings.error.invalid_gain"))
+            return
+
+        # Validate hotkey
+        hotkey_value = hotkey_var.get().strip().lower()
+        if hotkey_value in SettingsDialog._BLOCKED_HOTKEYS:
+            msg = (
+                f"{hotkey_value} cannot be used as it conflicts with "
+                "system or application functions.\n\n"
+                "Please choose a different hotkey (e.g., f6, f7, ctrl+space)."
+            )
+            messagebox.showwarning("Invalid Hotkey", msg)
             return
 
         # Apply changes to config
@@ -442,8 +694,10 @@ class SettingsDialog:
         self._config.stt.api_model = stt_api_model_var.get().strip()
         self._config.stt.model_size = stt_model_var.get().strip()
         self._config.stt.device = stt_device_var.get().strip()
+        self._config.stt.realtime_api_key = stt_realtime_api_key_var.get().strip()
+        self._config.stt.realtime_api_model = stt_realtime_api_model_var.get().strip()
         self._config.audio.gain_boost = gain_value
-        self._config.overlay.capsule_position = capsule_pos_var.get().strip()
+        self._config.overlay.capsule_position_mode = capsule_pos_var.get().strip()
         self._config.language = lang_var.get().strip()
 
         try:

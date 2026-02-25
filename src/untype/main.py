@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 
+import numpy as np
 import pyperclip
 
 from untype.audio import AudioRecorder, normalize_audio
@@ -22,7 +23,7 @@ from untype.platform import (
     get_foreground_window,
     verify_foreground_window,
 )
-from untype.stt import STTApiEngine, STTEngine
+from untype.stt import STTApiEngine, STTEngine, STTRealtimeApiEngine
 from untype.tray import TrayApp
 
 logger = logging.getLogger(__name__)
@@ -117,7 +118,10 @@ class UnTypeApp:
 
         logger.info("Initialising overlay...")
         self._overlay = CapsuleOverlay(
-            capsule_position=self._config.overlay.capsule_position,
+            capsule_position_mode=self._config.overlay.capsule_position_mode,
+            capsule_fixed_x=self._config.overlay.capsule_fixed_x,
+            capsule_fixed_y=self._config.overlay.capsule_fixed_y,
+            on_position_changed=self._on_capsule_position_changed,
             on_hold_inject=self._on_hold_inject,
             on_hold_copy=self._on_hold_copy,
             on_hold_ghost=self._on_hold_ghost,
@@ -312,6 +316,13 @@ class UnTypeApp:
                 )
                 self._digit_interceptor.set_active(True)
 
+            # Start realtime recognition session if using realtime_api backend.
+            if self._config.stt.backend == "realtime_api":
+                logger.info("Starting realtime recognition session...")
+                if isinstance(self._stt, STTRealtimeApiEngine):
+                    self._stt.start_recording_session()
+                self._overlay.show_realtime_preview(self._caret_x, self._caret_y)
+
             # Grab selected text to determine the interaction mode.
             # This happens while recording is already running.
             logger.info("Grabbing selected text...")
@@ -370,20 +381,31 @@ class UnTypeApp:
                 logger.warning("Empty audio buffer — aborting pipeline")
                 self._digit_interceptor.set_active(False)
                 self._overlay.hide_recording_personas()
+                self._overlay.hide_realtime_preview()
                 self._tray.update_status("Ready")
                 self._overlay.hide()
                 return
 
-            # 2. Normalize audio (amplify whispered speech).
-            self._tray.update_status("Transcribing...")
-            self._overlay.update_status("Transcribing...")
-            logger.info("Normalising audio (gain=%.1f)...", self._config.audio.gain_boost)
-            audio = normalize_audio(audio, self._config.audio.gain_boost)
+            # 2. Transcribe (or get realtime result).
+            if self._config.stt.backend == "realtime_api":
+                # For realtime API, the result was already accumulated during recording.
+                # Just stop the session and get the final result.
+                logger.info("Stopping realtime recognition session...")
+                if isinstance(self._stt, STTRealtimeApiEngine):
+                    text = self._stt.stop_session()
+                else:
+                    text = ""
+                text = text.strip()
+            else:
+                # For API and local backends, normalize and transcribe.
+                self._tray.update_status("Transcribing...")
+                self._overlay.update_status("Transcribing...")
+                logger.info("Normalising audio (gain=%.1f)...", self._config.audio.gain_boost)
+                audio = normalize_audio(audio, self._config.audio.gain_boost)
 
-            # 3. Transcribe.
-            logger.info("Transcribing audio...")
-            text = self._stt.transcribe(audio)
-            text = text.strip()
+                logger.info("Transcribing audio...")
+                text = self._stt.transcribe(audio)
+                text = text.strip()
 
             # Checkpoint: cancel requested during transcription?
             if self._cancel_requested.is_set():
@@ -394,6 +416,7 @@ class UnTypeApp:
                 logger.warning("Empty transcription — aborting pipeline")
                 self._digit_interceptor.set_active(False)
                 self._overlay.hide_recording_personas()
+                self._overlay.hide_realtime_preview()
                 self._tray.update_status("Ready")
                 self._overlay.hide()
                 return
@@ -1034,7 +1057,7 @@ class UnTypeApp:
             logger.info("STT settings changed — reinitialising engine...")
             old_stt = self._stt
             self._stt = self._init_stt()
-            if isinstance(old_stt, STTApiEngine):
+            if isinstance(old_stt, (STTApiEngine, STTRealtimeApiEngine)):
                 old_stt.close()
 
         # --- LLM client ---
@@ -1053,14 +1076,14 @@ class UnTypeApp:
                 self._llm.close()
             self._llm = self._init_llm_client()
 
-        # --- Overlay capsule position ---
-        if new_config.overlay.capsule_position != old.overlay.capsule_position:
+        # --- Overlay capsule position mode ---
+        if new_config.overlay.capsule_position_mode != old.overlay.capsule_position_mode:
             logger.info(
-                "Capsule position changed (%r→%r)",
-                old.overlay.capsule_position,
-                new_config.overlay.capsule_position,
+                "Capsule position mode changed (%r→%r)",
+                old.overlay.capsule_position_mode,
+                new_config.overlay.capsule_position_mode,
             )
-            self._overlay.set_capsule_position(new_config.overlay.capsule_position)
+            self._overlay.set_capsule_position_mode(new_config.overlay.capsule_position_mode)
 
         # --- Personas ---
         self._personas = load_personas()
@@ -1072,6 +1095,17 @@ class UnTypeApp:
         """Handle persona changes pushed from the persona manager dialog."""
         self._personas = load_personas()
         logger.info("Reloaded %d persona(s) from persona manager", len(self._personas))
+
+    def _on_capsule_position_changed(self, x: int, y: int) -> None:
+        """Handle capsule position change from drag (fixed mode)."""
+        self._config.overlay.capsule_fixed_x = x
+        self._config.overlay.capsule_fixed_y = y
+        # Save to config file
+        try:
+            save_config(self._config)
+            logger.debug("Saved capsule position: %d, %d", x, y)
+        except Exception:
+            logger.exception("Failed to save capsule position")
 
     # ------------------------------------------------------------------
     # Quit
@@ -1085,7 +1119,7 @@ class UnTypeApp:
         self._overlay.stop()
         if self._llm is not None:
             self._llm.close()
-        if isinstance(self._stt, STTApiEngine):
+        if isinstance(self._stt, (STTApiEngine, STTRealtimeApiEngine)):
             self._stt.close()
         self._tray.stop()
         logger.info("Goodbye.")
@@ -1100,9 +1134,29 @@ class UnTypeApp:
         return AudioRecorder(
             sample_rate=self._config.audio.sample_rate,
             device=device,
+            on_volume=self._on_audio_volume,
+            on_audio_chunk=self._on_audio_chunk,
         )
 
-    def _init_stt(self) -> STTEngine | STTApiEngine:
+    def _on_audio_volume(self, level: float) -> None:
+        """Handle audio volume update from the recorder (called from audio thread)."""
+        self._overlay.update_volume(level)
+
+    def _on_audio_chunk(self, chunk: np.ndarray) -> None:
+        """Handle audio chunk during recording for realtime STT (called from audio thread)."""
+        if self._config.stt.backend == "realtime_api":
+            if isinstance(self._stt, STTRealtimeApiEngine):
+                self._stt.on_audio_chunk(chunk)
+
+    def _on_realtime_text_update(self, text: str) -> None:
+        """Handle realtime text update from streaming STT (called from STT thread).
+
+        Updates the live transcription preview on the overlay during recording.
+        """
+        logger.debug("Realtime text update: %s", text)
+        self._overlay.update_realtime_preview(text)
+
+    def _init_stt(self) -> STTEngine | STTApiEngine | STTRealtimeApiEngine:
         """Create an STT engine from the current config."""
         cfg = self._config.stt
 
@@ -1115,6 +1169,25 @@ class UnTypeApp:
                 language=cfg.language,
                 sample_rate=self._config.audio.sample_rate,
             )
+
+        if cfg.backend == "realtime_api":
+            # Use realtime_api_key if set, otherwise fall back to api_key
+            api_key = cfg.realtime_api_key or cfg.api_key
+            if api_key:
+                logger.info("Using Realtime API STT backend (%s)", cfg.realtime_api_model)
+                return STTRealtimeApiEngine(
+                    api_key=api_key,
+                    model=cfg.realtime_api_model,
+                    language=cfg.language,
+                    format=cfg.realtime_api_format,
+                    sample_rate=cfg.realtime_api_sample_rate,
+                    on_text_update=self._on_realtime_text_update,
+                )
+            else:
+                logger.warning(
+                    "Realtime API selected but no API key configured, "
+                    "falling back to local"
+                )
 
         logger.info("Using local STT backend (model=%s)", cfg.model_size)
         return STTEngine(

@@ -22,11 +22,14 @@
 - **AI 润色输出** — 不是原始转录。LLM 在文本到达光标前，自动修正标点、语气词、语法和识别错误。
 - **语音编辑选中文字** — 选中文字，说出指令，LLM 执行修改。语音版的超级查找替换。
 - **按键说话** — 按一下快捷键（默认 F6）开始录音，再按一下结束。也可切换为按住模式。在任何应用中都能用。
-- **双语音识别后端** — 在线 API（OpenAI 兼容）或本地推理（[faster-whisper](https://github.com/SYSTRAN/faster-whisper)）。自由选择。
+- **音量可视化** — 录音时胶囊底部显示音量条，实时反馈麦克风状态。
+- **三语音识别后端** — 在线 API（OpenAI 兼容）、本地推理（[faster-whisper](https://github.com/SYSTRAN/faster-whisper)）或阿里云实时 API。自由选择。
+- **实时转录预览** — 使用阿里云实时 API 时，录音过程中即可看到识别文字，体验类似微信语音输入。
 - **系统托盘界面** — 带颜色状态指示的托盘图标 + 设置对话框。
+- **快捷键录制** — 在设置中点击输入框后按下想要的键，即可自定义快捷键。
 - **人格面具** — 录音时按数字键（1-9）或点击即可预选 LLM 人格。为不同场景定义语气配置：学术、职场、日常、要点整理——每个都有独立的提示词、模型和温度。往 `personas/` 目录放一个 JSON 文件就能新增人格。预选人格后跳过暂存区，工作流更快。
 - **后悔药** — 注入后出现撤销菜单，支持恢复原文、重新生成或撤回编辑。没有倒计时压力。
-- **胶囊位置可调** — 可选择胶囊跟随光标、固定在屏幕底部居中或左下角。
+- **胶囊位置可调** — 固定模式（可拖动，位置会被记住）或跟随光标模式。
 
 ## 工作原理
 
@@ -85,16 +88,38 @@ uv run untype
 |------|-----|--------|------|
 | `hotkey` | `trigger` | `f6` | 按键说话快捷键 |
 | `hotkey` | `mode` | `toggle` | `toggle`（按一下开始/结束）或 `hold`（按住说话） |
-| `overlay` | `capsule_position` | `caret` | 胶囊位置：`caret`（跟随光标）、`bottom_center`（底部居中）、`bottom_left`（左下角） |
+| `overlay` | `capsule_position_mode` | `"fixed"` | 胶囊位置模式：`"fixed"`（可拖动）或 `"caret"`（跟随光标） |
+| `overlay` | `capsule_fixed_x` | `null` | 固定模式的 X 坐标（null = 自动居中） |
+| `overlay` | `capsule_fixed_y` | `null` | 固定模式的 Y 坐标（null = 自动底部） |
 | `audio` | `gain_boost` | `3.0` | 低音量语音增益倍数 |
-| `stt` | `backend` | `api` | `api` 或 `local` |
+| `stt` | `backend` | `api` | `api`、`local` 或 `realtime_api` |
 | `stt` | `api_base_url` | `""` | OpenAI 兼容 STT API 端点 |
 | `stt` | `api_key` | `""` | STT API 密钥 |
 | `stt` | `api_model` | `gpt-4o-transcribe` | STT 模型名称 |
+| `stt` | `realtime_api_key` | `""` | 阿里云实时 STT API 密钥（留空则使用 api_key） |
+| `stt` | `realtime_api_model` | `paraformer-realtime-v2` | 阿里云实时 STT 模型 |
 | `stt` | `model_size` | `small` | 本地 Whisper 模型大小 |
 | `llm` | `base_url` | `""` | OpenAI 兼容 Chat API 端点 |
 | `llm` | `api_key` | `""` | LLM API 密钥 |
 | `llm` | `model` | `""` | LLM 模型名称 |
+
+### STT 后端选择
+
+**在线 API（默认）**
+- 使用 OpenAI 兼容的 `/audio/transcriptions` 接口
+- 支持任意中转服务
+- 录音结束后一次性返回结果
+
+**本地模型**
+- 使用 [faster-whisper](https://github.com/SYSTRAN/faster-whisper) 本地推理
+- 需要显卡支持（CUDA）
+- 隐私性好，无需联网
+
+**阿里云实时 API（新增）**
+- 使用阿里云 DashScope 实时语音识别
+- **录音过程中实时显示识别文字**
+- 延迟更低，体验接近微信语音输入
+- 需要申请 [阿里云 DashScope API Key](https://dashscope.console.aliyun.com/)
 
 ### 人格面具
 
@@ -131,10 +156,16 @@ uv run ruff format src/      # 代码格式化
 uv run pytest                # 运行测试
 ```
 
-## 开发计划
-
-- **分发** — 通过 PyInstaller/Nuitka 打包成独立 `.exe`。无需安装 Python。
-
 ## 许可证
 
 本项目采用 [GNU 通用公共许可证 v3.0](LICENSE) 授权。
+
+## 更新日志
+
+### v0.2.0 (2025-02-25)
+- 新增阿里云实时语音识别后端，录音过程中实时显示识别文字
+- 新增胶囊位置固定模式（可拖动，位置会被记住）
+- 新增设置界面字段动态显示（根据后端选择显示/隐藏相关配置）
+- 修复快捷键切换时的竞态条件问题
+- 修复快捷键黑名单（防止与系统快捷键冲突）
+- 修复后悔菜单位置跟随胶囊配置

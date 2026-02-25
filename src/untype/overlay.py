@@ -85,7 +85,10 @@ class CapsuleOverlay:
 
     def __init__(
         self,
-        capsule_position: str = "caret",
+        capsule_position_mode: str = "fixed",
+        capsule_fixed_x: int | None = None,
+        capsule_fixed_y: int | None = None,
+        on_position_changed: Callable[[int, int], None] | None = None,
         on_hold_inject: Callable[[], None] | None = None,
         on_hold_copy: Callable[[], None] | None = None,
         on_hold_ghost: Callable[[], None] | None = None,
@@ -94,7 +97,10 @@ class CapsuleOverlay:
         on_ghost_regenerate: Callable[[], None] | None = None,
         on_ghost_use_raw: Callable[[], None] | None = None,
     ) -> None:
-        self._capsule_position = capsule_position  # "caret", "bottom_center", "bottom_left"
+        self._capsule_position_mode = capsule_position_mode  # "caret" or "fixed"
+        self._capsule_fixed_x = capsule_fixed_x
+        self._capsule_fixed_y = capsule_fixed_y
+        self._on_position_changed = on_position_changed
         self._on_hold_inject = on_hold_inject
         self._on_hold_copy = on_hold_copy
         self._on_hold_ghost = on_hold_ghost
@@ -149,9 +155,17 @@ class CapsuleOverlay:
         self._rec_persona_bar_w: int = 0  # measured width for right-alignment
         self._rec_persona_bar_h: int = 0  # measured height for above-capsule placement
 
+        # Realtime preview state
+        self._realtime_preview_window: tk.Toplevel | None = None
+        self._realtime_preview_label: tk.Label | None = None
+        self._realtime_preview_x: int = 0
+        self._realtime_preview_y: int = 0
+
         # Cancel button state
         self._cancel_btn_id: int | None = None
         self._cancel_hover: bool = False
+        self._volume_bar_id: int | None = None
+        self._volume_bg_id: int | None = None
 
         # Ghost menu state
         self._ghost_window: tk.Toplevel | None = None
@@ -193,13 +207,26 @@ class CapsuleOverlay:
         """Hide the capsule."""
         self._queue.put(("HIDE",))
 
-    def set_capsule_position(self, position: str) -> None:
-        """Update the capsule position preference.
+    def set_capsule_position_mode(self, mode: str) -> None:
+        """Update the capsule position mode.
 
         Args:
-            position: One of "caret", "bottom_center", "bottom_left".
+            mode: One of "caret" (follow cursor) or "fixed" (draggable).
         """
-        self._capsule_position = position
+        self._capsule_position_mode = mode
+
+    def set_capsule_fixed_position(self, x: int, y: int) -> None:
+        """Update the saved fixed position for fixed mode."""
+        self._capsule_fixed_x = x
+        self._capsule_fixed_y = y
+
+    def update_volume(self, level: float) -> None:
+        """Update the volume indicator in the capsule.
+
+        Args:
+            level: Audio level from 0.0 to 1.0.
+        """
+        self._queue.put(("VOLUME", level))
 
     def show_hold_bubble(self, text: str, x: int, y: int) -> None:
         """Show the hold-for-delivery bubble with a text preview."""
@@ -290,12 +317,70 @@ class CapsuleOverlay:
         self._queue.put(("REC_PERSONAS_HIDE",))
 
     # ------------------------------------------------------------------
+    # Realtime transcription preview (thread-safe public API)
+    # ------------------------------------------------------------------
+
+    def show_realtime_preview(self, x: int, y: int) -> None:
+        """Show the realtime transcription preview window below the capsule.
+
+        The preview displays streaming transcription text during recording.
+        """
+        self._queue.put(("REALTIME_PREVIEW_SHOW", x, y))
+
+    def update_realtime_preview(self, text: str) -> None:
+        """Update the text shown in the realtime preview window.
+
+        Args:
+            text: The current accumulated transcription text.
+        """
+        self._queue.put(("REALTIME_PREVIEW_UPDATE", text))
+
+    def hide_realtime_preview(self) -> None:
+        """Hide the realtime preview window."""
+        self._queue.put(("REALTIME_PREVIEW_HIDE",))
+
+    # ------------------------------------------------------------------
     # Ghost menu (thread-safe public API)
     # ------------------------------------------------------------------
 
     def show_ghost_menu(self, x: int, y: int) -> None:
-        """Show the ghost menu icon near the caret after text injection."""
+        """Show the ghost menu icon near the caret after text injection.
+
+        If capsule_position is fixed, the ghost menu is placed at a fixed
+        position near the capsule instead of following the caret.
+        """
+        # Check if we should use a fixed position
+        fixed_pos = self._get_ghost_fixed_position()
+        if fixed_pos is not None:
+            x, y = fixed_pos
         self._queue.put(("GHOST_SHOW", x, y))
+
+    def _get_ghost_fixed_position(self) -> tuple[int, int] | None:
+        """Calculate fixed ghost menu position based on capsule_position config.
+
+        Returns None if ghost should follow caret (capsule_position_mode == "caret").
+        """
+        if self._capsule_position_mode != "fixed":
+            return None
+
+        # Get the capsule window's actual current position (not the saved config)
+        # This ensures ghost follows the capsule when user drags it
+        win = self._capsule_window
+        if win is None:
+            return None
+
+        try:
+            cx = win.winfo_x()
+            cy = win.winfo_y()
+        except Exception:
+            return None
+
+        # Position ghost to the right of the capsule
+        gx = cx + _CAPSULE_W + 16
+        gy = cy
+        return (gx, gy)
+
+        return None
 
     def hide_ghost_menu(self) -> None:
         """Hide and destroy the ghost menu."""
@@ -352,17 +437,33 @@ class CapsuleOverlay:
             fill="#2a2a2a", outline="#ffffff", width=2, dash=(14, 8),
         )
 
+        # Volume bar background (bottom of capsule).
+        vol_bar_y = _CAPSULE_H - 8
+        vol_bar_h = 3
+        self._volume_bg_id = canvas.create_rectangle(
+            12, vol_bar_y, _CAPSULE_W - 12, vol_bar_y + vol_bar_h,
+            fill="#1a1a1a", outline="",
+        )
+        # Volume bar foreground (filled based on level).
+        self._volume_bar_id = canvas.create_rectangle(
+            12, vol_bar_y, 12, vol_bar_y + vol_bar_h,
+            fill="#4CAF50", outline="",
+        )
+        canvas.itemconfigure(self._volume_bar_id, state="hidden")
+        canvas.itemconfigure(self._volume_bg_id, state="hidden")
+
         # Status text (centred, bold white label).
         self._text_id = canvas.create_text(
-            _CAPSULE_W // 2, _CAPSULE_H // 2,
+            _CAPSULE_W // 2, (_CAPSULE_H - 6) // 2,
             text="", fill="#e0e0e0",
             font=("Segoe UI", 11, "bold"),
             anchor="center",
         )
 
         # Cancel "×" button (right edge, initially hidden).
+        # Position aligned with text (accounting for volume bar at bottom).
         self._cancel_btn_id = canvas.create_text(
-            _CAPSULE_W - 14, _CAPSULE_H // 2,
+            _CAPSULE_W - 14, (_CAPSULE_H - 6) // 2,
             text="\u00d7", fill="#666666",
             font=("Segoe UI", 13, "bold"),
             anchor="center",
@@ -384,8 +485,80 @@ class CapsuleOverlay:
             ),
         )
 
+        # Drag state for fixed mode
+        self._drag_start_x: int = 0
+        self._drag_start_y: int = 0
+        self._dragging: bool = False
+
+        # Bind drag events to the capsule body (but not cancel button)
+        canvas.tag_bind(self._capsule_id, "<Button-1>", self._on_drag_start)
+        canvas.tag_bind(self._capsule_id, "<B1-Motion>", self._on_drag_motion)
+        canvas.tag_bind(self._capsule_id, "<ButtonRelease-1>", self._on_drag_end)
+
         self._canvas = canvas
         self._capsule_window = win
+
+    def _on_drag_start(self, event: tk.Event) -> None:  # type: ignore[type-arg]
+        """Start dragging the capsule (only in fixed mode)."""
+        if self._capsule_position_mode != "fixed":
+            return
+        self._dragging = True
+        self._drag_start_x = event.x_root
+        self._drag_start_y = event.y_root
+
+    def _on_drag_motion(self, event: tk.Event) -> None:  # type: ignore[type-arg]
+        """Drag the capsule to new position."""
+        if not self._dragging:
+            return
+        win = self._capsule_window
+        if win is None:
+            return
+
+        dx = event.x_root - self._drag_start_x
+        dy = event.y_root - self._drag_start_y
+
+        # Get current position
+        geom = win.geometry()
+        # Parse geometry: "widthxheight+x+y"
+        parts = geom.split("+")
+        if len(parts) >= 3:
+            current_x = int(parts[1])
+            current_y = int(parts[2])
+            new_x = current_x + dx
+            new_y = current_y + dy
+
+            # Keep on screen
+            screen_w = win.winfo_screenwidth()
+            screen_h = win.winfo_screenheight()
+            new_x = max(0, min(new_x, screen_w - _CAPSULE_W))
+            new_y = max(0, min(new_y, screen_h - _CAPSULE_H))
+
+            win.geometry(f"+{new_x}+{new_y}")
+            self._drag_start_x = event.x_root
+            self._drag_start_y = event.y_root
+
+    def _on_drag_end(self, event: tk.Event) -> None:  # type: ignore[type-arg]
+        """End dragging and save the new position."""
+        if not self._dragging:
+            return
+        self._dragging = False
+
+        win = self._capsule_window
+        if win is None:
+            return
+
+        # Get final position and save it
+        geom = win.geometry()
+        parts = geom.split("+")
+        if len(parts) >= 3:
+            new_x = int(parts[1])
+            new_y = int(parts[2])
+            self._capsule_fixed_x = new_x
+            self._capsule_fixed_y = new_y
+
+            # Notify main app to save to config
+            if self._on_position_changed is not None:
+                self._on_position_changed(new_x, new_y)
 
     def _on_cancel_click(self, event: object = None) -> None:
         """Handle click on the capsule cancel button."""
@@ -446,11 +619,22 @@ class CapsuleOverlay:
             self._do_select_recording_persona(index)
         elif op == "REC_PERSONAS_HIDE":
             self._do_hide_recording_personas()
+        elif op == "REALTIME_PREVIEW_SHOW":
+            _, x, y = cmd
+            self._do_show_realtime_preview(x, y)
+        elif op == "REALTIME_PREVIEW_UPDATE":
+            _, text = cmd
+            self._do_update_realtime_preview(text)
+        elif op == "REALTIME_PREVIEW_HIDE":
+            self._do_hide_realtime_preview()
         elif op == "GHOST_SHOW":
             _, x, y = cmd
             self._do_show_ghost_menu(x, y)
         elif op == "GHOST_HIDE":
             self._do_hide_ghost_menu()
+        elif op == "VOLUME":
+            _, level = cmd
+            self._do_update_volume(level)
         elif op == "QUIT":
             self._do_quit()
 
@@ -463,26 +647,23 @@ class CapsuleOverlay:
 
         Returns None if position should follow caret.
         """
-        if self._capsule_position == "caret":
+        if self._capsule_position_mode != "fixed":
             return None
 
         root = self._root
         if root is None:
             return None
 
+        # Use saved position if available, otherwise default to bottom center
+        if self._capsule_fixed_x is not None and self._capsule_fixed_y is not None:
+            return (self._capsule_fixed_x, self._capsule_fixed_y)
+
+        # Default position: bottom center of screen
         screen_w = root.winfo_screenwidth()
         screen_h = root.winfo_screenheight()
-
-        if self._capsule_position == "bottom_center":
-            px = (screen_w - _CAPSULE_W) // 2
-            py = screen_h - _CAPSULE_H - 80  # Above taskbar
-            return (px, py)
-        elif self._capsule_position == "bottom_left":
-            px = 24
-            py = screen_h - _CAPSULE_H - 80
-            return (px, py)
-
-        return None
+        px = (screen_w - _CAPSULE_W) // 2
+        py = screen_h - _CAPSULE_H - 80  # Above taskbar
+        return (px, py)
 
     def _do_show(self, x: int, y: int, status: str) -> None:
         win = self._capsule_window
@@ -542,19 +723,21 @@ class CapsuleOverlay:
             "Recording...", "Transcribing...", "Processing...",
         )
         show_cancel = status in _CANCEL_STATUSES
+        # Text Y position: centered in the area above the volume bar
+        text_y = (_CAPSULE_H - 6) // 2
         if self._cancel_btn_id is not None:
             if show_cancel:
                 canvas.itemconfigure(self._cancel_btn_id, state="normal")
                 # Shift main text slightly left to avoid overlap with X.
                 canvas.coords(
                     self._text_id,
-                    (_CAPSULE_W - 28) // 2, _CAPSULE_H // 2,
+                    (_CAPSULE_W - 28) // 2, text_y,
                 )
             else:
                 canvas.itemconfigure(self._cancel_btn_id, state="hidden")
                 canvas.coords(
                     self._text_id,
-                    _CAPSULE_W // 2, _CAPSULE_H // 2,
+                    _CAPSULE_W // 2, text_y,
                 )
 
         # Start/stop alpha-breathing animation.
@@ -573,6 +756,50 @@ class CapsuleOverlay:
             if win is not None:
                 win.attributes("-alpha", _CAPSULE_ALPHA_MAX)
 
+        # Show/hide volume bar based on recording status.
+        show_volume = status == "Recording..."
+        if self._volume_bar_id is not None and self._volume_bg_id is not None:
+            if show_volume:
+                canvas.itemconfigure(self._volume_bg_id, state="normal")
+                # Volume bar starts empty
+                vol_bar_y = _CAPSULE_H - 8
+                canvas.coords(self._volume_bar_id, 12, vol_bar_y, 12, vol_bar_y + 3)
+            else:
+                canvas.itemconfigure(self._volume_bar_id, state="hidden")
+                canvas.itemconfigure(self._volume_bg_id, state="hidden")
+
+    def _do_update_volume(self, level: float) -> None:
+        """Update the volume bar based on audio level."""
+        canvas = self._canvas
+        if canvas is None:
+            return
+
+        # Only show during recording
+        if self._current_status != "Recording...":
+            return
+
+        vol_bar_y = _CAPSULE_H - 8
+        bar_width = _CAPSULE_W - 24  # 12px padding on each side
+        filled_width = int(bar_width * min(1.0, max(0.0, level)))
+
+        # Update the volume bar
+        if self._volume_bar_id is not None:
+            canvas.coords(
+                self._volume_bar_id,
+                12, vol_bar_y, 12 + filled_width, vol_bar_y + 3
+            )
+            canvas.itemconfigure(self._volume_bar_id, state="normal")
+
+        # Color based on level (green -> yellow -> red)
+        if self._volume_bar_id is not None:
+            if level < 0.5:
+                color = "#4CAF50"  # Green
+            elif level < 0.8:
+                color = "#FFC107"  # Yellow
+            else:
+                color = "#F44336"  # Red
+            canvas.itemconfigure(self._volume_bar_id, fill=color)
+
     def _do_hide(self) -> None:
         self._animating = False
         self._flying = False
@@ -580,10 +807,17 @@ class CapsuleOverlay:
         # Hide cancel button.
         if self._cancel_btn_id is not None and self._canvas is not None:
             self._canvas.itemconfigure(self._cancel_btn_id, state="hidden")
+        # Hide volume bar.
+        if self._volume_bar_id is not None and self._canvas is not None:
+            self._canvas.itemconfigure(self._volume_bar_id, state="hidden")
+        if self._volume_bg_id is not None and self._canvas is not None:
+            self._canvas.itemconfigure(self._volume_bg_id, state="hidden")
         win = self._capsule_window
         if win is not None:
             win.withdraw()
             win.attributes("-alpha", _CAPSULE_ALPHA_MAX)
+        # Also hide realtime preview
+        self._do_hide_realtime_preview()
 
     def _do_quit(self) -> None:
         self._animating = False
@@ -593,6 +827,7 @@ class CapsuleOverlay:
             self._do_hide_hold_bubble()
             self._do_hide_staging()
             self._do_hide_recording_personas()
+            self._do_hide_realtime_preview()
             self._do_hide_ghost_menu()
             # Unblock any pipeline thread waiting on staging.
             self._staging_result_action = "cancel"
@@ -608,11 +843,11 @@ class CapsuleOverlay:
     def _do_fly_to_corner(self) -> None:
         """Fly the capsule to the bottom-right corner, keep it breathing.
 
-        If capsule_position is fixed (bottom_center/bottom_left), skip the
-        flight and just keep the capsule in place.
+        If capsule_position_mode is fixed, skip the flight and just keep
+        the capsule in place.
         """
         # Skip flight animation for fixed positions
-        if self._capsule_position != "caret":
+        if self._capsule_position_mode != "caret":
             # Just mark as "at corner" so hold bubble logic works
             self._capsule_at_corner = True
             return
@@ -629,7 +864,7 @@ class CapsuleOverlay:
         For fixed positions, skip flight and show bubble directly.
         """
         # For fixed positions, just show the bubble in place
-        if self._capsule_position != "caret":
+        if self._capsule_position_mode != "caret":
             win = self._capsule_window
             if win is not None:
                 win.withdraw()
@@ -977,17 +1212,23 @@ class CapsuleOverlay:
         self._rec_persona_on_click = on_click
         self._rec_persona_window = win
 
-        # Position below the capsule.  The capsule's top-left is placed by
-        # _do_show at (x + 12, y - _CAPSULE_H - 8).
-        capsule_x = x + 12
-        capsule_y = y - _CAPSULE_H - 8
-
-        # Keep on-screen (same logic as _do_show).
-        screen_w = win.winfo_screenwidth()
-        if capsule_x + _CAPSULE_W > screen_w:
-            capsule_x = x - _CAPSULE_W - 12
-        if capsule_y < 0:
-            capsule_y = y + 24
+        # Position relative to the capsule's actual position.
+        # Get capsule window's current position (works for both caret-following
+        # and fixed positions).
+        capsule_win = self._capsule_window
+        if capsule_win is not None:
+            capsule_win.update_idletasks()
+            capsule_x = capsule_win.winfo_x()
+            capsule_y = capsule_win.winfo_y()
+        else:
+            # Fallback: calculate from cursor position (legacy behavior)
+            capsule_x = x + 12
+            capsule_y = y - _CAPSULE_H - 8
+            screen_w = win.winfo_screenwidth()
+            if capsule_x + _CAPSULE_W > screen_w:
+                capsule_x = x - _CAPSULE_W - 12
+            if capsule_y < 0:
+                capsule_y = y + 24
 
         bar_y = capsule_y + _CAPSULE_H + 4
 
@@ -1031,6 +1272,116 @@ class CapsuleOverlay:
             self._rec_persona_on_click = None
             self._rec_persona_bar_w = 0
             self._rec_persona_bar_h = 0
+        # Also hide realtime preview when hiding personas
+        self._do_hide_realtime_preview()
+
+    # ------------------------------------------------------------------
+    # Realtime transcription preview (appears below persona bar)
+    # ------------------------------------------------------------------
+
+    def _do_show_realtime_preview(self, x: int, y: int) -> None:
+        """Create and show the realtime transcription preview window."""
+        root = self._root
+        if root is None:
+            return
+
+        # Destroy any existing preview window
+        self._do_hide_realtime_preview()
+
+        # Save capsule position for positioning the preview
+        self._realtime_preview_x = x
+        self._realtime_preview_y = y
+
+        win = tk.Toplevel(root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.attributes("-alpha", 0.85)
+
+        try:
+            set_window_noactivate(win)
+        except Exception:
+            logger.debug("set_window_noactivate failed on realtime preview")
+
+        # Calculate position: below the persona bar (if visible) or capsule
+        # Get actual capsule window position
+        if self._capsule_window:
+            try:
+                cx = self._capsule_window.winfo_x()
+                cy = self._capsule_window.winfo_y()
+            except Exception:
+                cx, cy = x, y
+        else:
+            cx, cy = x, y
+
+        # Position below persona bar if visible, otherwise below capsule
+        if self._rec_persona_window:
+            # Position below the persona bar
+            px = cx
+            py = cy + _CAPSULE_H + 8 + self._rec_persona_bar_h + 4
+        else:
+            # Position directly below capsule
+            px = cx
+            py = cy + _CAPSULE_H + 8
+
+        # Keep on-screen horizontally
+        try:
+            screen_w = win.winfo_screenwidth()
+            screen_h = win.winfo_screenheight()
+        except Exception:
+            # Fallback to reasonable defaults
+            screen_w = 1920
+            screen_h = 1080
+
+        preview_w = 280
+        if px + preview_w > screen_w:
+            px = screen_w - preview_w - 8
+        if px < 8:
+            px = 8
+
+        # Keep on-screen vertically
+        if py + 80 > screen_h:
+            py = screen_h - 80 - 8
+
+        win.geometry(f"+{px}+{py}")
+
+        # Configure window background
+        win.configure(bg="#2a2a2a")
+
+        # Create label for live text (directly in window, no canvas)
+        label = tk.Label(
+            win,
+            text="",
+            font=("Microsoft YaHei UI", 10),
+            bg="#2a2a2a",
+            fg="#cccccc",
+            wraplength=preview_w - 16,
+            justify="left",
+            anchor="nw",
+            padx=8,
+            pady=8,
+        )
+        label.pack(fill="both", expand=True)
+
+        self._realtime_preview_window = win
+        self._realtime_preview_label = label
+
+    def _do_update_realtime_preview(self, text: str) -> None:
+        """Update the text in the realtime preview window."""
+        if self._realtime_preview_label is not None:
+            # Truncate if too long for display
+            max_len = 100
+            display_text = text if len(text) <= max_len else text[:max_len] + "..."
+            self._realtime_preview_label.configure(text=display_text)
+
+    def _do_hide_realtime_preview(self) -> None:
+        """Destroy the realtime preview window."""
+        if self._realtime_preview_window is not None:
+            try:
+                self._realtime_preview_window.destroy()
+            except Exception:
+                pass
+            self._realtime_preview_window = None
+            self._realtime_preview_label = None
 
     # ------------------------------------------------------------------
     # Staging area (Phase 3)

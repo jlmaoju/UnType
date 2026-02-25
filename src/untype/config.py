@@ -25,8 +25,12 @@ class HotkeyConfig:
 
 @dataclass
 class OverlayConfig:
-    # Capsule initial position: "caret" (follow cursor), "bottom_center", "bottom_left"
-    capsule_position: str = "caret"
+    # Capsule position mode: "caret" (follow cursor) or "fixed" (draggable)
+    capsule_position_mode: str = "fixed"
+    # Fixed position (x, y) - only used when capsule_position_mode == "fixed"
+    # Defaults to None, which means auto-center at bottom of screen
+    capsule_fixed_x: int | None = None
+    capsule_fixed_y: int | None = None
 
 
 @dataclass
@@ -38,7 +42,7 @@ class AudioConfig:
 
 @dataclass
 class STTConfig:
-    # Backend: "local" (faster-whisper) or "api" (OpenAI-compatible)
+    # Backend: "local", "api", or "realtime_api" (Aliyun WebSocket)
     backend: str = "api"
     # Local model settings
     model_size: str = "small"
@@ -48,10 +52,15 @@ class STTConfig:
     beam_size: int = 5
     vad_filter: bool = True
     vad_threshold: float = 0.3
-    # API settings
+    # API settings (OpenAI-compatible)
     api_base_url: str = ""
     api_key: str = ""
     api_model: str = "gpt-4o-transcribe"
+    # Realtime API settings (Aliyun DashScope)
+    realtime_api_key: str = ""  # Empty = use api_key
+    realtime_api_model: str = "paraformer-realtime-v2"
+    realtime_api_format: str = "pcm"  # Audio format: "pcm" or "opus"
+    realtime_api_sample_rate: int = 16000  # Must match audio config
 
 
 @dataclass
@@ -172,8 +181,17 @@ def _dict_to_config(data: dict) -> AppConfig:
 
 
 def _config_to_dict(config: AppConfig) -> dict:
-    """Convert an AppConfig to a plain dict suitable for TOML serialization."""
-    return asdict(config)
+    """Convert an AppConfig to a plain dict suitable for TOML serialization.
+
+    Filters out None values since TOML doesn't support null.
+    """
+    data = asdict(config)
+    # Recursively remove None values
+    def _remove_none(obj: object) -> object:
+        if isinstance(obj, dict):
+            return {k: _remove_none(v) for k, v in obj.items() if v is not None}
+        return obj
+    return _remove_none(data)  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------

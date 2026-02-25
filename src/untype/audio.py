@@ -7,6 +7,7 @@ in memory -- nothing ever touches disk.
 from __future__ import annotations
 
 import threading
+from typing import Callable
 
 import numpy as np
 import sounddevice as sd
@@ -23,11 +24,27 @@ class AudioRecorder:
     device:
         PortAudio device index or name.  ``None`` uses the system default
         input device.
+    on_volume:
+        Optional callback invoked with current audio level (0.0-1.0)
+        during recording. Called from the audio thread, so must be
+        thread-safe.
+    on_audio_chunk:
+        Optional callback invoked with each audio chunk during recording.
+        Called from the audio thread with Float32 numpy array.
+        Allows realtime streaming to STT engines.
     """
 
-    def __init__(self, sample_rate: int = 16000, device: int | str | None = None):
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        device: int | str | None = None,
+        on_volume: Callable[[float], None] | None = None,
+        on_audio_chunk: Callable[[np.ndarray], None] | None = None,
+    ):
         self.sample_rate = sample_rate
         self.device = device
+        self._on_volume = on_volume
+        self._on_audio_chunk = on_audio_chunk
 
         self._lock = threading.Lock()
         self._stream: sd.InputStream | None = None
@@ -94,8 +111,28 @@ class AudioRecorder:
             # Silently drop overflow/underflow info; could be logged later.
             pass
         # indata is only valid inside the callback, so copy.
+        chunk = indata.copy()
         with self._lock:
-            self._chunks.append(indata.copy())
+            self._chunks.append(chunk)
+
+        # Call audio chunk callback for realtime streaming
+        if self._on_audio_chunk is not None:
+            try:
+                # Pass the chunk (flattened to 1D as expected by STT engines)
+                self._on_audio_chunk(chunk.flatten())
+            except Exception:
+                pass  # Ignore errors in chunk callback
+
+        # Calculate RMS volume and call the callback
+        if self._on_volume is not None:
+            try:
+                rms = float(np.sqrt(np.mean(indata**2)))
+                # Normalize to 0.0-1.0 range (typical speech RMS is 0.01-0.2)
+                # Use a logarithmic-ish scaling for better visual feedback
+                level = min(1.0, rms * 10.0)
+                self._on_volume(level)
+            except Exception:
+                pass  # Ignore errors in volume callback
 
 
 # -- module-level helpers -----------------------------------------------------

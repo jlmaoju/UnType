@@ -19,6 +19,7 @@ from untype.config import (
     load_personas,
     save_persona,
 )
+from untype.i18n import t
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ class PersonaManagerDialog:
     def show(self) -> None:
         """Show the dialog (blocks until closed)."""
         root = tk.Tk()
-        root.title("UnType — Persona Manager")
+        root.title(t("persona.title"))
         root.resizable(True, True)
         root.minsize(600, 420)
         root.attributes("-topmost", True)
@@ -71,7 +72,7 @@ class PersonaManagerDialog:
         outer.rowconfigure(0, weight=1)
 
         # Left: persona list
-        list_frame = ttk.LabelFrame(outer, text="Personas", padding=6)
+        list_frame = ttk.LabelFrame(outer, text=t("persona.list.title"), padding=6)
         list_frame.grid(row=0, column=0, sticky="ns", padx=(0, 8))
         list_frame.rowconfigure(0, weight=1)
 
@@ -90,31 +91,31 @@ class PersonaManagerDialog:
         self._listbox.configure(yscrollcommand=list_scroll.set)
 
         # Right: editor (scrollable)
-        editor_frame = ttk.LabelFrame(outer, text="Editor", padding=6)
+        editor_frame = ttk.LabelFrame(outer, text=t("persona.editor.title"), padding=6)
         editor_frame.grid(row=0, column=1, sticky="nsew")
         editor_frame.columnconfigure(1, weight=1)
 
         row = 0
         self._id_var = tk.StringVar(master=root)
-        row = self._text_row(root, editor_frame, "ID:", self._id_var, row)
+        row = self._text_row(root, editor_frame, t("persona.id"), self._id_var, row)
 
         self._name_var = tk.StringVar(master=root)
-        row = self._text_row(root, editor_frame, "Name:", self._name_var, row)
+        row = self._text_row(root, editor_frame, t("persona.name"), self._name_var, row)
 
         self._icon_var = tk.StringVar(master=root)
-        row = self._text_row(root, editor_frame, "Icon:", self._icon_var, row)
+        row = self._text_row(root, editor_frame, t("persona.icon"), self._icon_var, row)
 
         self._model_var = tk.StringVar(master=root)
-        row = self._text_row(root, editor_frame, "Model:", self._model_var, row)
+        row = self._text_row(root, editor_frame, t("persona.model"), self._model_var, row)
 
         self._temp_var = tk.StringVar(master=root)
-        row = self._text_row(root, editor_frame, "Temperature:", self._temp_var, row)
+        row = self._text_row(root, editor_frame, t("persona.temperature"), self._temp_var, row)
 
         self._maxtok_var = tk.StringVar(master=root)
-        row = self._text_row(root, editor_frame, "Max Tokens:", self._maxtok_var, row)
+        row = self._text_row(root, editor_frame, t("persona.max_tokens"), self._maxtok_var, row)
 
         # Insert prompt (multi-line)
-        ttk.Label(editor_frame, text="Insert Prompt:").grid(
+        ttk.Label(editor_frame, text=t("persona.prompt_insert")).grid(
             row=row,
             column=0,
             sticky="nw",
@@ -144,7 +145,7 @@ class PersonaManagerDialog:
         row += 1
 
         # Polish prompt (multi-line)
-        ttk.Label(editor_frame, text="Polish Prompt:").grid(
+        ttk.Label(editor_frame, text=t("persona.prompt_polish")).grid(
             row=row,
             column=0,
             sticky="nw",
@@ -176,7 +177,7 @@ class PersonaManagerDialog:
         # Save button
         save_btn_frame = ttk.Frame(editor_frame)
         save_btn_frame.grid(row=row, column=0, columnspan=2, sticky="e", pady=(8, 0))
-        ttk.Button(save_btn_frame, text="Save", command=self._on_save).pack(side="right")
+        ttk.Button(save_btn_frame, text=t("persona.save"), command=self._on_save).pack(side="right")
         row += 1
 
         # Status / error label
@@ -193,19 +194,19 @@ class PersonaManagerDialog:
         toolbar = ttk.Frame(outer)
         toolbar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
 
-        ttk.Button(toolbar, text="+ New", command=self._on_new).pack(side="left")
-        ttk.Button(toolbar, text="Delete", command=self._on_delete).pack(
+        ttk.Button(toolbar, text=t("persona.new"), command=self._on_new).pack(side="left")
+        ttk.Button(toolbar, text=t("persona.delete"), command=self._on_delete).pack(
             side="left",
             padx=(6, 0),
         )
-        ttk.Button(toolbar, text="Open Folder", command=self._on_open_folder).pack(
+        ttk.Button(toolbar, text=t("persona.open_folder"), command=self._on_open_folder).pack(
             side="left",
             padx=(6, 0),
         )
-        ttk.Button(toolbar, text="Export", command=self._on_export).pack(
+        ttk.Button(toolbar, text=t("persona.export"), command=self._on_export).pack(
             side="right",
         )
-        ttk.Button(toolbar, text="Import", command=self._on_import).pack(
+        ttk.Button(toolbar, text=t("persona.import"), command=self._on_import).pack(
             side="right",
             padx=(0, 6),
         )
@@ -283,21 +284,21 @@ class PersonaManagerDialog:
         icon = self._icon_var.get().strip()
 
         if not pid:
-            self._status_var.set("ID is required.")
+            self._status_var.set(t("persona.error.id_required"))
             return None
         if not _ID_PATTERN.match(pid):
-            self._status_var.set("ID must contain only a-z, A-Z, 0-9, _ or -.")
+            self._status_var.set(t("persona.error.id_format"))
             return None
         # Check collision with other personas (not self).
         for p in self._personas:
             if p.id == pid and pid != self._editing_original_id:
-                self._status_var.set(f"ID '{pid}' already exists.")
+                self._status_var.set(t("persona.error.id_exists", id=pid))
                 return None
         if not name:
-            self._status_var.set("Name is required.")
+            self._status_var.set(t("persona.error.name_required"))
             return None
         if not icon:
-            self._status_var.set("Icon is required.")
+            self._status_var.set(t("persona.error.icon_required"))
             return None
 
         # Optional: temperature
@@ -307,10 +308,10 @@ class PersonaManagerDialog:
             try:
                 temperature = float(temp_str)
                 if not 0.0 <= temperature <= 2.0:
-                    self._status_var.set("Temperature must be between 0.0 and 2.0.")
+                    self._status_var.set(t("persona.error.temp_range"))
                     return None
             except ValueError:
-                self._status_var.set("Temperature must be a number.")
+                self._status_var.set(t("persona.error.temp_number"))
                 return None
 
         # Optional: max_tokens
@@ -320,10 +321,10 @@ class PersonaManagerDialog:
             try:
                 max_tokens = int(maxtok_str)
                 if max_tokens <= 0:
-                    self._status_var.set("Max Tokens must be a positive integer.")
+                    self._status_var.set(t("persona.error.maxtok_positive"))
                     return None
             except ValueError:
-                self._status_var.set("Max Tokens must be a positive integer.")
+                self._status_var.set(t("persona.error.maxtok_positive"))
                 return None
 
         return Persona(
@@ -400,8 +401,8 @@ class PersonaManagerDialog:
             return
         persona = self._personas[self._selected_index]
         if not messagebox.askyesno(
-            "Delete Persona",
-            f"Delete persona '{persona.icon} {persona.name}'?",
+            t("persona.delete_title"),
+            t("persona.delete_confirm", icon=persona.icon, name=persona.name),
             parent=self._root,
         ):
             return
@@ -412,7 +413,7 @@ class PersonaManagerDialog:
 
     def _on_import(self) -> None:
         files = filedialog.askopenfilenames(
-            title="Import Personas",
+            title=t("persona.import_title"),
             filetypes=[("JSON files", "*.json")],
             parent=self._root,
         )
@@ -441,8 +442,8 @@ class PersonaManagerDialog:
             pid = data["id"]
             if pid in existing_ids:
                 if not messagebox.askyesno(
-                    "Overwrite?",
-                    f"Persona '{pid}' already exists. Overwrite?",
+                    t("persona.import_overwrite_title"),
+                    t("persona.import_overwrite", id=pid),
                     parent=self._root,
                 ):
                     continue
@@ -457,14 +458,14 @@ class PersonaManagerDialog:
                 logger.warning("Import: failed to write %s: %s", dest, exc)
 
         self._refresh_list()
-        self._status_var.set(f"Imported {imported} persona(s).")
+        self._status_var.set(t("persona.import_success", count=imported))
 
     def _on_export(self) -> None:
         if self._selected_index < 0:
             return
         persona = self._personas[self._selected_index]
         path = filedialog.asksaveasfilename(
-            title="Export Persona",
+            title=t("persona.export_title"),
             defaultextension=".json",
             initialfile=f"{persona.id}.json",
             filetypes=[("JSON files", "*.json")],
@@ -476,7 +477,7 @@ class PersonaManagerDialog:
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            self._status_var.set(f"Exported to {Path(path).name}")
+            self._status_var.set(t("persona.export_success", file=Path(path).name))
         except OSError as exc:
             self._status_var.set(f"Export failed: {exc}")
 
