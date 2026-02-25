@@ -17,7 +17,9 @@ Most voice input tools give you raw transcription — full of filler words, brok
 
 **UnType = STT + LLM.** Your speech is transcribed, then an LLM refines it into clean, well-formatted text — ready to use as-is.
 
-**Built-in 6 Persona Masks** for different contexts:
+**Built-in 8 Persona Masks** for different contexts:
+- ✨ Default — Regular polish style, clean and natural
+- 🌙 Poetic — Ornate literary style with metaphors and refined vocabulary
 - 👔 To Boss — Formal, tactful workplace communication
 - 🤝 To Colleague — Friendly yet professional daily exchange
 - 📋 Bullet Points — Auto-organize into a concise list
@@ -25,7 +27,7 @@ Most voice input tools give you raw transcription — full of filler words, brok
 - 🗣️ Plain Talk — Make complex ideas simple
 - 🙅 Decline — Politely turn down requests
 
-Press a digit key (1-6) during recording to switch, or right-click tray icon → **Personas** to customize.
+Press a digit key (1-8) during recording to switch. Your choice is remembered for next time. Right-click tray icon → **Personas** to customize.
 
 ## Core Features
 
@@ -37,11 +39,13 @@ Press a digit key (1-6) during recording to switch, or right-click tray icon →
 ## Experience Details
 
 - **Realtime transcription preview** — See recognized text appear during recording with Aliyun realtime API, similar to WeChat voice input
+- **Recording duration display** — Shows elapsed time on capsule (e.g., "1:23"), auto-stops after 5 minutes
 - **Volume visualization** — Real-time volume bar at the bottom of the capsule during recording
+- **Persona memory** — Remembers your last selected persona, auto-selects it next time
 - **Ghost Menu** — Post-injection undo menu: revert to raw draft, regenerate, or reopen editor. No countdown pressure.
 - **Adjustable capsule position** — Choose fixed (draggable, position saved) or follow cursor mode
 - **Hotkey recording** — Click the input field in settings and press your desired key
-- **System tray UI** — Color-coded status indicator + settings dialog
+- **File logging** — Open logs folder from Settings for troubleshooting
 
 ## Quick Start
 
@@ -74,8 +78,8 @@ Settings are stored in `~/.untype/config.toml` (created on first launch):
 | `hotkey` | `trigger` | `f6` | Push-to-talk hotkey |
 | `hotkey` | `mode` | `toggle` | `toggle` (press to start/stop) or `hold` (hold to speak) |
 | `overlay` | `capsule_position_mode` | `"fixed"` | Capsule position mode: `"fixed"` (draggable) or `"caret"` (follow cursor) |
-| `audio` | `gain_boost` | `3.0` | Gain multiplier for quiet speech |
-| `stt` | `backend` | `api` | `api`, `local`, or `realtime_api` |
+| `audio` | `gain_boost` | `1.5` | Gain multiplier for quiet speech |
+| `stt` | `backend` | `realtime_api` | `realtime_api` (Aliyun), `api`, or `local` |
 
 ### STT Backend Selection
 
@@ -135,6 +139,17 @@ uv run pytest                # Run tests
 This project is licensed under the [GNU General Public License v3.0](LICENSE).
 
 ## Changelog
+
+### v0.2.1 (2025-02-26)
+- Add "Default" persona (regular polish style)
+- Add "Poetic" persona (ornate literary style with metaphors)
+- Add persona memory feature — remembers your last selected persona
+- Add recording duration display (shows time like "1:23" on capsule)
+- Add recording timeout protection (auto-stops after 5 minutes)
+- Add file logging (open log folder from Settings)
+- Change default STT backend to Aliyun Realtime API
+- Adjust default audio gain to 1.5
+- Move "Open Logs" button to Settings dialog
 
 ### v0.2.0 (2025-02-25)
 - Add Aliyun realtime speech recognition backend with live transcription preview during recording
