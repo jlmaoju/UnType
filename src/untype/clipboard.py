@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import time
 
 import pyperclip
 from pynput.keyboard import Controller, Key
 
 from untype.platform import get_modifier_key
+
+logger = logging.getLogger(__name__)
 
 _keyboard = Controller()
 
@@ -62,22 +65,37 @@ def grab_selected_text() -> tuple[str | None, str | None]:
     return None, original
 
 
-def inject_text(text: str, original_clipboard: str | None) -> None:
+def inject_text(text: str, original_clipboard: str | None) -> bool:
     """Inject *text* at the current cursor position via Ctrl+V.
 
     After pasting, the original clipboard content is restored so the user's
     clipboard is not clobbered.
+
+    Returns:
+        True if the text was successfully copied to clipboard (does not
+        verify actual paste success). The original clipboard is always
+        restored regardless of the result.
     """
+    injection_succeeded = False
+
     try:
         pyperclip.copy(text)
-    except pyperclip.PyperclipException:
-        return
+        injection_succeeded = True
+    except pyperclip.PyperclipException as e:
+        logger.warning("Failed to copy text to clipboard: %s", e)
 
-    time.sleep(0.05)
-    _simulate_hotkey(get_modifier_key(), "v")
-    time.sleep(0.1)
+    if injection_succeeded:
+        try:
+            time.sleep(0.05)
+            _simulate_hotkey(get_modifier_key(), "v")
+            time.sleep(0.1)
+        except Exception as e:
+            logger.warning("Failed to simulate Ctrl+V: %s", e)
 
+    # Always restore the original clipboard, regardless of injection success
     restore_clipboard(original_clipboard)
+
+    return injection_succeeded
 
 
 def _simulate_hotkey(key: Key, char: str) -> None:
@@ -102,10 +120,14 @@ def _simulate_hotkey(key: Key, char: str) -> None:
 def _release_all_modifiers() -> None:
     """Send key-up events for all common modifier keys."""
     for mod in (
-        Key.alt_l, Key.alt_r,
-        Key.ctrl_l, Key.ctrl_r,
-        Key.shift_l, Key.shift_r,
-        Key.cmd_l, Key.cmd_r,
+        Key.alt_l,
+        Key.alt_r,
+        Key.ctrl_l,
+        Key.ctrl_r,
+        Key.shift_l,
+        Key.shift_r,
+        Key.cmd_l,
+        Key.cmd_r,
     ):
         try:
             _keyboard.release(mod)

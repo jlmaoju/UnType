@@ -53,6 +53,11 @@ _BREATHING_PERIOD = 2.5  # seconds per full alpha cycle
 _FLY_DURATION_MS = 650  # total flight time
 _FLY_FRAME_MS = 12  # ~83 fps for ultra-smooth motion
 
+# Hold bubble auto-dismiss
+_BUBBLE_AUTO_DISMISS_MS = 5000  # 5 seconds before auto-dismiss
+_BUBBLE_FADE_DURATION_MS = 500  # 0.5 seconds fade-out animation
+_BUBBLE_FADE_FRAME_MS = 20  # ~50 fps fade animation
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -65,6 +70,25 @@ def _ease_in_out_cubic(t: float) -> float:
         return 4.0 * t * t * t
     p = -2.0 * t + 2.0
     return 1.0 - p * p * p / 2.0
+
+
+def _apply_noactivate(win: tk.Toplevel | tk.Tk, context: str = "") -> None:
+    """Apply WS_EX_NOACTIVATE to a window, logging any failures.
+
+    Parameters
+    ----------
+    win:
+        The tkinter window (Tk or Toplevel) to modify.
+    context:
+        Optional description for debug logging (e.g., "capsule", "hold bubble").
+    """
+    try:
+        set_window_noactivate(win)
+    except Exception:
+        logger.debug(
+            f"set_window_noactivate failed{' on ' + context if context else ''} "
+            "— overlay may steal focus"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -114,14 +138,28 @@ class CapsuleOverlay:
         self._root: tk.Tk | None = None
         self._started = threading.Event()
 
+        # Timer tracking for cleanup
+        self._poll_timer: str | None = None
+        self._anim_timer: str | None = None
+        self._fly_timer: str | None = None
+
         # Canvas items (set on overlay thread)
         self._canvas: tk.Canvas | None = None
         self._capsule_id: int | None = None
         self._text_id: int | None = None
+        self._capsule_window: tk.Toplevel | None = None
 
         # Hold bubble state
         self._bubble_canvas: tk.Canvas | None = None
         self._bubble_window: tk.Toplevel | None = None
+        self._bubble_dismiss_timer: str | None = None  # Auto-dismiss timer
+        self._bubble_countdown_timer: str | None = None  # Countdown update timer
+        self._bubble_fade_timer: str | None = None  # Fade animation timer
+        self._bubble_fade_alpha: float = 0.9  # Current alpha during fade
+        self._bubble_close_btn_id: int | None = None  # Close button text ID
+        self._bubble_countdown_id: int | None = None  # Countdown text ID
+        self._bubble_hovering_close: bool = False  # Hovering over close button
+        self._bubble_countdown_remaining: int = 0  # Remaining seconds
 
         # Staging area state (Phase 3)
         self._staging_window: tk.Toplevel | None = None
@@ -155,6 +193,10 @@ class CapsuleOverlay:
         self._rec_persona_bar_w: int = 0  # measured width for right-alignment
         self._rec_persona_bar_h: int = 0  # measured height for above-capsule placement
 
+        # Recording duration state
+        self._recording_duration: float = 0.0  # Current recording duration in seconds
+        self._recording_warning: bool = False  # Near timeout warning state
+
         # Realtime preview state
         self._realtime_preview_window: tk.Toplevel | None = None
         self._realtime_preview_label: tk.Label | None = None
@@ -186,7 +228,9 @@ class CapsuleOverlay:
         if self._thread is not None:
             return
         self._thread = threading.Thread(
-            target=self._run, name="untype-overlay", daemon=True,
+            target=self._run,
+            name="untype-overlay",
+            daemon=True,
         )
         self._thread.start()
         self._started.wait(timeout=5.0)
@@ -227,6 +271,15 @@ class CapsuleOverlay:
             level: Audio level from 0.0 to 1.0.
         """
         self._queue.put(("VOLUME", level))
+
+    def update_duration(self, duration_seconds: float, warning: bool = False) -> None:
+        """Update the recording duration displayed on the capsule.
+
+        Args:
+            duration_seconds: Current recording duration in seconds.
+            warning: If True, show warning color (near timeout).
+        """
+        self._queue.put(("DURATION", duration_seconds, warning))
 
     def show_hold_bubble(self, text: str, x: int, y: int) -> None:
         """Show the hold-for-delivery bubble with a text preview."""
@@ -380,8 +433,6 @@ class CapsuleOverlay:
         gy = cy
         return (gx, gy)
 
-        return None
-
     def hide_ghost_menu(self) -> None:
         """Hide and destroy the ghost menu."""
         self._queue.put(("GHOST_HIDE",))
@@ -400,11 +451,27 @@ class CapsuleOverlay:
             self._setup_capsule_window(root)
             self._started.set()
 
-            root.after(_POLL_INTERVAL_MS, self._poll_queue)
+            # Start polling — _poll_queue will track the timer ID
+            self._poll_queue()
             root.mainloop()
+        except tk.TclError:
+            # TclError can occur when the mainloop is destroyed externally
+            # (e.g., during application shutdown). This is expected behavior
+            # and should not be logged as an error.
+            logger.debug("Tkinter mainloop terminated via TclError")
+            self._started.set()  # ensure start() is unblocked
         except Exception:
             logger.exception("Overlay thread crashed")
             self._started.set()  # unblock start() even on failure
+        finally:
+            # Final cleanup: ensure root is destroyed if it exists
+            root = self._root
+            if root is not None:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+            self._root = None
 
     def _setup_capsule_window(self, root: tk.Tk) -> None:
         """Create the capsule Toplevel and canvas."""
@@ -417,45 +484,61 @@ class CapsuleOverlay:
         win.withdraw()
 
         # Apply WS_EX_NOACTIVATE so this window never steals focus.
-        try:
-            set_window_noactivate(win)
-        except Exception:
-            logger.debug(
-                "set_window_noactivate failed — overlay may steal focus",
-            )
+        _apply_noactivate(win, "capsule")
 
         canvas = tk.Canvas(
-            win, width=_CAPSULE_W, height=_CAPSULE_H,
-            bg=_TRANSPARENT_COLOR, highlightthickness=0, bd=0,
+            win,
+            width=_CAPSULE_W,
+            height=_CAPSULE_H,
+            bg=_TRANSPARENT_COLOR,
+            highlightthickness=0,
+            bd=0,
         )
         canvas.pack(fill="both", expand=True)
 
         # Main capsule body (pill shape, monochrome, stitch-edge dashed border).
         self._capsule_id = _draw_rounded_rect(
             canvas,
-            2, 2, _CAPSULE_W - 2, _CAPSULE_H - 2, _CAPSULE_R - 2,
-            fill="#2a2a2a", outline="#ffffff", width=2, dash=(14, 8),
+            2,
+            2,
+            _CAPSULE_W - 2,
+            _CAPSULE_H - 2,
+            _CAPSULE_R - 2,
+            fill="#2a2a2a",
+            outline="#ffffff",
+            width=2,
+            dash=(14, 8),
         )
 
         # Volume bar background (bottom of capsule).
         vol_bar_y = _CAPSULE_H - 8
         vol_bar_h = 3
         self._volume_bg_id = canvas.create_rectangle(
-            12, vol_bar_y, _CAPSULE_W - 12, vol_bar_y + vol_bar_h,
-            fill="#1a1a1a", outline="",
+            12,
+            vol_bar_y,
+            _CAPSULE_W - 12,
+            vol_bar_y + vol_bar_h,
+            fill="#1a1a1a",
+            outline="",
         )
         # Volume bar foreground (filled based on level).
         self._volume_bar_id = canvas.create_rectangle(
-            12, vol_bar_y, 12, vol_bar_y + vol_bar_h,
-            fill="#4CAF50", outline="",
+            12,
+            vol_bar_y,
+            12,
+            vol_bar_y + vol_bar_h,
+            fill="#4CAF50",
+            outline="",
         )
         canvas.itemconfigure(self._volume_bar_id, state="hidden")
         canvas.itemconfigure(self._volume_bg_id, state="hidden")
 
         # Status text (centred, bold white label).
         self._text_id = canvas.create_text(
-            _CAPSULE_W // 2, (_CAPSULE_H - 6) // 2,
-            text="", fill="#e0e0e0",
+            _CAPSULE_W // 2,
+            (_CAPSULE_H - 6) // 2,
+            text="",
+            fill="#e0e0e0",
             font=("Segoe UI", 11, "bold"),
             anchor="center",
         )
@@ -463,22 +546,26 @@ class CapsuleOverlay:
         # Cancel "×" button (right edge, initially hidden).
         # Position aligned with text (accounting for volume bar at bottom).
         self._cancel_btn_id = canvas.create_text(
-            _CAPSULE_W - 14, (_CAPSULE_H - 6) // 2,
-            text="\u00d7", fill="#666666",
+            _CAPSULE_W - 14,
+            (_CAPSULE_H - 6) // 2,
+            text="\u00d7",
+            fill="#666666",
             font=("Segoe UI", 13, "bold"),
             anchor="center",
             state="hidden",
         )
         canvas.tag_bind(self._cancel_btn_id, "<Button-1>", self._on_cancel_click)
         canvas.tag_bind(
-            self._cancel_btn_id, "<Enter>",
+            self._cancel_btn_id,
+            "<Enter>",
             lambda e: (
                 canvas.itemconfigure(self._cancel_btn_id, fill="#ff6666"),
                 setattr(self, "_cancel_hover", True),
             ),
         )
         canvas.tag_bind(
-            self._cancel_btn_id, "<Leave>",
+            self._cancel_btn_id,
+            "<Leave>",
             lambda e: (
                 canvas.itemconfigure(self._cancel_btn_id, fill="#666666"),
                 setattr(self, "_cancel_hover", False),
@@ -586,7 +673,8 @@ class CapsuleOverlay:
         except queue.Empty:
             pass
 
-        root.after(_POLL_INTERVAL_MS, self._poll_queue)
+        # Schedule next poll and track the timer ID
+        self._poll_timer = root.after(_POLL_INTERVAL_MS, self._poll_queue)
 
     def _dispatch(self, cmd: tuple) -> None:
         op = cmd[0]
@@ -635,6 +723,9 @@ class CapsuleOverlay:
         elif op == "VOLUME":
             _, level = cmd
             self._do_update_volume(level)
+        elif op == "DURATION":
+            _, duration, warning = cmd
+            self._do_update_duration(duration, warning)
         elif op == "QUIT":
             self._do_quit()
 
@@ -668,6 +759,13 @@ class CapsuleOverlay:
     def _do_show(self, x: int, y: int, status: str) -> None:
         win = self._capsule_window
         if win is None:
+            return
+
+        # Visibility check: skip if window is already visible and at target position
+        # This prevents redundant operations and flicker
+        if win.winfo_ismapped() and not self._capsule_at_corner:
+            # Still update status even if visible
+            self._do_update_status(status)
             return
 
         self._capsule_at_corner = False
@@ -720,7 +818,9 @@ class CapsuleOverlay:
 
         # Show/hide cancel button based on pipeline status.
         _CANCEL_STATUSES = (
-            "Recording...", "Transcribing...", "Processing...",
+            "Recording...",
+            "Transcribing...",
+            "Processing...",
         )
         show_cancel = status in _CANCEL_STATUSES
         # Text Y position: centered in the area above the volume bar
@@ -731,18 +831,21 @@ class CapsuleOverlay:
                 # Shift main text slightly left to avoid overlap with X.
                 canvas.coords(
                     self._text_id,
-                    (_CAPSULE_W - 28) // 2, text_y,
+                    (_CAPSULE_W - 28) // 2,
+                    text_y,
                 )
             else:
                 canvas.itemconfigure(self._cancel_btn_id, state="hidden")
                 canvas.coords(
                     self._text_id,
-                    _CAPSULE_W // 2, text_y,
+                    _CAPSULE_W // 2,
+                    text_y,
                 )
 
         # Start/stop alpha-breathing animation.
         _ANIM_STATUSES = (
-            "Recording...", "Transcribing...",
+            "Recording...",
+            "Transcribing...",
             "Processing...",
         )
         should_animate = status in _ANIM_STATUSES
@@ -784,10 +887,7 @@ class CapsuleOverlay:
 
         # Update the volume bar
         if self._volume_bar_id is not None:
-            canvas.coords(
-                self._volume_bar_id,
-                12, vol_bar_y, 12 + filled_width, vol_bar_y + 3
-            )
+            canvas.coords(self._volume_bar_id, 12, vol_bar_y, 12 + filled_width, vol_bar_y + 3)
             canvas.itemconfigure(self._volume_bar_id, state="normal")
 
         # Color based on level (green -> yellow -> red)
@@ -800,7 +900,56 @@ class CapsuleOverlay:
                 color = "#F44336"  # Red
             canvas.itemconfigure(self._volume_bar_id, fill=color)
 
+    def _do_update_duration(self, duration_seconds: float, warning: bool = False) -> None:
+        """Update the recording duration display on the capsule.
+
+        Args:
+            duration_seconds: Current recording duration in seconds.
+            warning: If True, show warning color (near timeout).
+        """
+        self._recording_duration = duration_seconds
+        self._recording_warning = warning
+
+        canvas = self._canvas
+        if canvas is None:
+            return
+
+        # Only update during recording
+        if self._current_status != "Recording...":
+            return
+
+        # Format duration as M:SS (e.g., "1:23", "12:34")
+        minutes = int(duration_seconds // 60)
+        seconds = int(duration_seconds % 60)
+        duration_text = f"{minutes}:{seconds:02d}"
+
+        # Build status text: "Recording 1:23" or just "1:23" if space is tight
+        label = duration_text
+
+        # Update text color based on warning state
+        if warning:
+            text_color = "#FFC107"  # Yellow/orange for warning
+        else:
+            text_color = "#e0e0e0"  # Default white
+
+        # Account for cancel button in position
+        text_y = (_CAPSULE_H - 6) // 2
+        if self._cancel_btn_id is not None:
+            cancel_state = canvas.itemcget(self._cancel_btn_id, "state")
+            if cancel_state == "normal":
+                # Shift text left to make room for X
+                canvas.coords(self._text_id, (_CAPSULE_W - 28) // 2, text_y)
+            else:
+                canvas.coords(self._text_id, _CAPSULE_W // 2, text_y)
+
+        canvas.itemconfigure(self._text_id, text=label, fill=text_color)
+
     def _do_hide(self) -> None:
+        win = self._capsule_window
+        # Visibility check: skip if window is already hidden
+        if win is not None and not win.winfo_ismapped():
+            return
+
         self._animating = False
         self._flying = False
         self._capsule_at_corner = False
@@ -812,7 +961,6 @@ class CapsuleOverlay:
             self._canvas.itemconfigure(self._volume_bar_id, state="hidden")
         if self._volume_bg_id is not None and self._canvas is not None:
             self._canvas.itemconfigure(self._volume_bg_id, state="hidden")
-        win = self._capsule_window
         if win is not None:
             win.withdraw()
             win.attributes("-alpha", _CAPSULE_ALPHA_MAX)
@@ -820,20 +968,64 @@ class CapsuleOverlay:
         self._do_hide_realtime_preview()
 
     def _do_quit(self) -> None:
+        # Stop all animations first to prevent re-queueing
         self._animating = False
         self._flying = False
+
         root = self._root
         if root is not None:
+            # Cancel all tracked after() timers
+            for timer_name, timer_id in [
+                ("poll", self._poll_timer),
+                ("anim", self._anim_timer),
+                ("fly", self._fly_timer),
+            ]:
+                if timer_id is not None:
+                    try:
+                        root.after_cancel(timer_id)
+                    except Exception:
+                        logger.debug(f"Exception canceling {timer_name} timer")
+                # Clear the tracking variable
+                if timer_name == "poll":
+                    self._poll_timer = None
+                elif timer_name == "anim":
+                    self._anim_timer = None
+                elif timer_name == "fly":
+                    self._fly_timer = None
+
+            # Hide all Toplevel windows with proper cleanup
             self._do_hide_hold_bubble()
             self._do_hide_staging()
             self._do_hide_recording_personas()
             self._do_hide_realtime_preview()
             self._do_hide_ghost_menu()
-            # Unblock any pipeline thread waiting on staging.
-            self._staging_result_action = "cancel"
-            self._staging_event.set()
-            root.quit()
-            root.destroy()
+
+            # Explicitly destroy the capsule window
+            if self._capsule_window is not None:
+                try:
+                    self._capsule_window.destroy()
+                except Exception:
+                    logger.debug("Exception destroying capsule window")
+                self._capsule_window = None
+
+            # Also stop ghost dismiss listeners if they're running
+            self._stop_ghost_dismiss_listeners()
+
+            # Unblock any pipeline thread waiting on staging
+            # (ensure _staging_event exists before trying to set it)
+            if hasattr(self, "_staging_event") and self._staging_event is not None:
+                self._staging_result_action = "cancel"
+                self._staging_event.set()
+
+            # Quit and destroy the main window with exception handling
+            try:
+                root.quit()
+            except Exception:
+                logger.debug("Exception during root.quit()")
+            try:
+                root.destroy()
+            except Exception:
+                logger.debug("Exception during root.destroy()")
             self._root = None
 
     # ------------------------------------------------------------------
@@ -910,7 +1102,7 @@ class CapsuleOverlay:
         self._fly_elapsed = 0
         self._flying = True
 
-        root.after(_FLY_FRAME_MS, self._animate_fly)
+        self._fly_timer = root.after(_FLY_FRAME_MS, self._animate_fly)
 
     def _animate_fly(self) -> None:
         """Per-frame position update for the capsule flight."""
@@ -984,7 +1176,7 @@ class CapsuleOverlay:
                     self._rec_persona_window.lift()
             return
 
-        root.after(_FLY_FRAME_MS, self._animate_fly)
+        self._fly_timer = root.after(_FLY_FRAME_MS, self._animate_fly)
 
     # ------------------------------------------------------------------
     # Hold bubble (Phase 2)
@@ -998,18 +1190,16 @@ class CapsuleOverlay:
         if root is None:
             return
 
-        # Destroy any existing bubble.
+        # Destroy any existing bubble and cancel timers.
         self._do_hide_hold_bubble()
 
         win = tk.Toplevel(root)
         win.overrideredirect(True)
         win.attributes("-topmost", True)
         win.attributes("-transparentcolor", _TRANSPARENT_COLOR)
+        win.attributes("-alpha", 0.9)  # Set initial alpha
 
-        try:
-            set_window_noactivate(win)
-        except Exception:
-            logger.debug("set_window_noactivate failed on hold bubble")
+        _apply_noactivate(win, "hold bubble")
 
         # Max text width in pixels (bubble minus padding).
         text_max_px = _BUBBLE_W - 32
@@ -1019,55 +1209,122 @@ class CapsuleOverlay:
 
         # Use a temporary canvas to measure text height.
         canvas = tk.Canvas(
-            win, width=_BUBBLE_W, height=400,
-            bg=_TRANSPARENT_COLOR, highlightthickness=0, bd=0,
+            win,
+            width=_BUBBLE_W,
+            height=400,
+            bg=_TRANSPARENT_COLOR,
+            highlightthickness=0,
+            bd=0,
         )
         canvas.pack(fill="both", expand=True)
 
         # Preview text.
         preview_id = canvas.create_text(
-            _BUBBLE_W // 2, 0,
-            text=preview, fill="white",
+            _BUBBLE_W // 2,
+            0,
+            text=preview,
+            fill="white",
             font=("Segoe UI", 10),
-            width=text_max_px, anchor="n",
+            width=text_max_px,
+            anchor="n",
         )
         bbox = canvas.bbox(preview_id)
         text_h = (bbox[3] - bbox[1]) if bbox else 16
 
-        # Compute bubble height: padding + text + gap + hint + padding
+        # Compute bubble height: top padding + text + gap + hint + bottom padding
         hint_h = 14
-        bubble_h = max(_BUBBLE_H, 12 + text_h + 4 + hint_h + 12)
+        top_padding = 18  # More space at top for close button and countdown
+        bottom_padding = 14  # Space at bottom for hint text
+        bubble_h = max(_BUBBLE_H, top_padding + text_h + 4 + hint_h + bottom_padding)
 
-        # Reposition text items centred in the final bubble.
-        text_y = (bubble_h - text_h - 4 - hint_h) // 2
-        canvas.coords(preview_id, _BUBBLE_W // 2, 4 + text_y)
+        # Calculate vertical positions.
+        # Content starts after top_padding, and we don't use centering anymore.
+        content_top = top_padding
+        preview_y = content_top
+        hint_y = content_top + text_h + 4
+
+        canvas.coords(preview_id, _BUBBLE_W // 2, preview_y)
 
         # Hint text.
-        hint_str = t("overlay.hold.hint")
+        hint_str = t("overlay.hold.hint", default="左键插入 | 右键复制 | 中键菜单")
         canvas.create_text(
-            _BUBBLE_W // 2, 4 + text_y + text_h + 4,
+            _BUBBLE_W // 2,
+            hint_y,
             text=hint_str,
             fill="#888888",
             font=("Segoe UI", 8),
-            width=text_max_px, anchor="n",
+            width=text_max_px,
+            anchor="n",
+        )
+
+        # Close button (×) in top-right corner.
+        close_x = _BUBBLE_W - 12
+        close_y = 14  # Move down slightly with increased padding
+        self._bubble_close_btn_id = canvas.create_text(
+            close_x,
+            close_y,
+            text="\u00d7",
+            fill="#666666",
+            font=("Segoe UI", 14, "bold"),
+        )
+        # Bind close button events.
+        canvas.tag_bind(
+            self._bubble_close_btn_id,
+            "<Button-1>",
+            lambda e: self._on_bubble_close_click(),
+        )
+        canvas.tag_bind(
+            self._bubble_close_btn_id,
+            "<Enter>",
+            lambda e: (
+                canvas.itemconfigure(self._bubble_close_btn_id, fill="#ff6666"),
+                setattr(self, "_bubble_hovering_close", True),
+            ),
+        )
+        canvas.tag_bind(
+            self._bubble_close_btn_id,
+            "<Leave>",
+            lambda e: (
+                canvas.itemconfigure(self._bubble_close_btn_id, fill="#666666"),
+                setattr(self, "_bubble_hovering_close", False),
+            ),
+        )
+
+        # Countdown timer display (left of close button).
+        countdown_x = _BUBBLE_W - 32
+        self._bubble_countdown_id = canvas.create_text(
+            countdown_x,
+            close_y,
+            text="5",
+            fill="#666666",
+            font=("Segoe UI", 8),
         )
 
         # Bubble body (drawn behind text — lower it).
         bg_id = _draw_rounded_rect(
             canvas,
-            4, 4, _BUBBLE_W - 4, bubble_h - 4,
+            4,
+            4,
+            _BUBBLE_W - 4,
+            bubble_h - 4,
             _BUBBLE_R,
-            fill="#2a2a2a", outline="#555555", width=1,
+            fill="#2a2a2a",
+            outline="#555555",
+            width=1,
         )
         canvas.tag_lower(bg_id)
 
         # Resize canvas to fit.
         canvas.configure(height=bubble_h)
 
-        # Click handlers.
+        # Click handlers for the bubble body (but not when clicking close button).
         canvas.bind("<Button-1>", lambda e: self._on_bubble_left_click())
         canvas.bind("<Button-2>", lambda e: self._on_bubble_middle_click())
         canvas.bind("<Button-3>", lambda e: self._on_bubble_right_click())
+
+        # Mouse hover: cancel auto-dismiss while hovering.
+        canvas.bind("<Enter>", self._on_bubble_enter)
+        canvas.bind("<Leave>", self._on_bubble_leave)
 
         # Position near bottom-right of screen.
         screen_w = win.winfo_screenwidth()
@@ -1078,10 +1335,188 @@ class CapsuleOverlay:
         win.geometry(f"{_BUBBLE_W}x{bubble_h}+{px}+{py}")
         win.deiconify()
 
+        # Reset hover state.
+        self._bubble_hovering_close = False
+        self._bubble_fade_alpha = 0.9
+
         self._bubble_window = win
         self._bubble_canvas = canvas
 
+        # Start countdown at 5 seconds.
+        self._bubble_countdown_remaining = 5
+        self._update_countdown_display()
+
+        # Start countdown update timer (updates every second).
+        self._bubble_countdown_timer = win.after(
+            1000,
+            self._on_countdown_tick,
+        )
+
+        # Start auto-dismiss timer (5 seconds).
+        self._bubble_dismiss_timer = win.after(
+            _BUBBLE_AUTO_DISMISS_MS,
+            self._on_bubble_dismiss_timer,
+        )
+
+    def _update_countdown_display(self) -> None:
+        """Update the countdown number on the bubble."""
+        if self._bubble_countdown_id is not None and self._bubble_canvas is not None:
+            try:
+                self._bubble_canvas.itemconfigure(
+                    self._bubble_countdown_id,
+                    text=str(self._bubble_countdown_remaining),
+                )
+                # Change color based on remaining time:
+                # 5-3 seconds: gray (#666666)
+                # 2 seconds: orange (#ff9900)
+                # 1 second: red (#ff3333)
+                if self._bubble_countdown_remaining >= 3:
+                    color = "#666666"
+                elif self._bubble_countdown_remaining == 2:
+                    color = "#ff9900"
+                else:
+                    color = "#ff3333"
+                self._bubble_canvas.itemconfigure(
+                    self._bubble_countdown_id,
+                    fill=color,
+                )
+            except Exception:
+                pass
+
+    def _on_countdown_tick(self) -> None:
+        """Called every second to update the countdown."""
+        # If hovering, don't count down.
+        if self._bubble_window is not None and self._bubble_countdown_remaining > 0:
+            self._bubble_countdown_remaining -= 1
+            self._update_countdown_display()
+
+            if self._bubble_countdown_remaining > 0:
+                # Schedule next tick.
+                self._bubble_countdown_timer = self._root.after(
+                    1000,
+                    self._on_countdown_tick,
+                )
+
+    def _on_bubble_close_click(self) -> None:
+        """Handle click on the hold bubble close button."""
+        self._do_hide_hold_bubble()
+
+    def _on_bubble_enter(self, event: object) -> None:
+        """Mouse entered the bubble - cancel auto-dismiss timer."""
+        # Cancel the dismiss timer.
+        if self._bubble_dismiss_timer is not None and self._root is not None:
+            try:
+                self._root.after_cancel(self._bubble_dismiss_timer)
+            except Exception:
+                pass
+            self._bubble_dismiss_timer = None
+        # Cancel the countdown update timer.
+        if self._bubble_countdown_timer is not None and self._root is not None:
+            try:
+                self._root.after_cancel(self._bubble_countdown_timer)
+            except Exception:
+                pass
+            self._bubble_countdown_timer = None
+        # Also cancel any ongoing fade animation.
+        if self._bubble_fade_timer is not None:
+            try:
+                self._root.after_cancel(self._bubble_fade_timer)
+            except Exception:
+                pass
+            self._bubble_fade_timer = None
+        # Restore full opacity if faded.
+        if self._bubble_window is not None and self._bubble_fade_alpha < 0.85:
+            self._bubble_fade_alpha = 0.9
+            try:
+                self._bubble_window.attributes("-alpha", 0.9)
+            except Exception:
+                pass
+        # Reset countdown to 5 seconds.
+        self._bubble_countdown_remaining = 5
+        self._update_countdown_display()
+
+    def _on_bubble_leave(self, event: object) -> None:
+        """Mouse left the bubble - restart auto-dismiss timer."""
+        # Only restart if not hovering over the close button.
+        if self._bubble_hovering_close:
+            return
+        if self._bubble_window is not None and self._root is not None:
+            # Restart countdown update timer (countdown was reset to 5 on enter).
+            self._bubble_countdown_timer = self._root.after(
+                1000,
+                self._on_countdown_tick,
+            )
+            # Restart dismiss timer with full 5 seconds.
+            self._bubble_dismiss_timer = self._root.after(
+                _BUBBLE_AUTO_DISMISS_MS,
+                self._on_bubble_dismiss_timer,
+            )
+
+    def _on_bubble_dismiss_timer(self) -> None:
+        """Called when auto-dismiss timer expires - start fade-out animation."""
+        if self._bubble_window is not None and self._bubble_fade_alpha > 0.1:
+            # Start fade-out animation.
+            self._bubble_fade_alpha = 0.9
+            self._animate_bubble_fade()
+        else:
+            # Already fading or gone - just hide.
+            self._do_hide_hold_bubble()
+
+    def _animate_bubble_fade(self) -> None:
+        """Animate the hold bubble fading out."""
+        if self._bubble_window is None or self._bubble_fade_alpha <= 0:
+            self._do_hide_hold_bubble()
+            return
+
+        # Calculate new alpha (linear fade from 0.9 to 0 over _BUBBLE_FADE_DURATION_MS).
+        alpha_step = 0.9 / (_BUBBLE_FADE_DURATION_MS / _BUBBLE_FADE_FRAME_MS)
+        self._bubble_fade_alpha -= alpha_step
+
+        if self._bubble_fade_alpha <= 0.05:
+            # Fade complete - hide the bubble.
+            self._do_hide_hold_bubble()
+            return
+
+        # Apply new alpha.
+        try:
+            self._bubble_window.attributes("-alpha", self._bubble_fade_alpha)
+        except Exception:
+            # Window might have been destroyed.
+            self._bubble_window = None
+            self._bubble_canvas = None
+            return
+
+        # Schedule next frame.
+        self._bubble_fade_timer = self._root.after(
+            _BUBBLE_FADE_FRAME_MS,
+            self._animate_bubble_fade,
+        )
+
     def _do_hide_hold_bubble(self) -> None:
+        # Cancel auto-dismiss timer.
+        if self._bubble_dismiss_timer is not None and self._root is not None:
+            try:
+                self._root.after_cancel(self._bubble_dismiss_timer)
+            except Exception:
+                pass
+            self._bubble_dismiss_timer = None
+
+        # Cancel countdown update timer.
+        if self._bubble_countdown_timer is not None and self._root is not None:
+            try:
+                self._root.after_cancel(self._bubble_countdown_timer)
+            except Exception:
+                pass
+            self._bubble_countdown_timer = None
+
+        # Cancel fade animation timer.
+        if self._bubble_fade_timer is not None and self._root is not None:
+            try:
+                self._root.after_cancel(self._bubble_fade_timer)
+            except Exception:
+                pass
+            self._bubble_fade_timer = None
+
         if self._bubble_window is not None:
             try:
                 self._bubble_window.destroy()
@@ -1089,6 +1524,10 @@ class CapsuleOverlay:
                 pass
             self._bubble_window = None
             self._bubble_canvas = None
+            self._bubble_close_btn_id = None
+            self._bubble_countdown_id = None
+            self._bubble_hovering_close = False
+            self._bubble_countdown_remaining = 0
 
     def _on_bubble_left_click(self) -> None:
         self._do_hide_hold_bubble()
@@ -1147,10 +1586,7 @@ class CapsuleOverlay:
         win.attributes("-topmost", True)
         win.attributes("-alpha", 0.9)
 
-        try:
-            set_window_noactivate(win)
-        except Exception:
-            logger.debug("set_window_noactivate failed on recording persona bar")
+        _apply_noactivate(win, "recording persona bar")
 
         frame = tk.Frame(win, bg="#2a2a2a")
         frame.pack(fill="both", expand=True)
@@ -1191,19 +1627,11 @@ class CapsuleOverlay:
             # Hover effects (only when not selected).
             lbl.bind(
                 "<Enter>",
-                lambda e, w=lbl: (
-                    w.configure(fg="#cccccc")
-                    if w.cget("bg") != "#4a4a8a"
-                    else None
-                ),
+                lambda e, w=lbl: w.configure(fg="#cccccc") if w.cget("bg") != "#4a4a8a" else None,
             )
             lbl.bind(
                 "<Leave>",
-                lambda e, w=lbl: (
-                    w.configure(fg="#888888")
-                    if w.cget("bg") != "#4a4a8a"
-                    else None
-                ),
+                lambda e, w=lbl: w.configure(fg="#888888") if w.cget("bg") != "#4a4a8a" else None,
             )
 
             labels.append(lbl)
@@ -1297,10 +1725,7 @@ class CapsuleOverlay:
         win.attributes("-topmost", True)
         win.attributes("-alpha", 0.85)
 
-        try:
-            set_window_noactivate(win)
-        except Exception:
-            logger.debug("set_window_noactivate failed on realtime preview")
+        _apply_noactivate(win, "realtime preview")
 
         # Calculate position: below the persona bar (if visible) or capsule
         # Get actual capsule window position
@@ -1470,7 +1895,10 @@ class CapsuleOverlay:
             undo=True,
         )
         text_widget.pack(
-            fill="both", expand=True, padx=8, pady=(8, 4),
+            fill="both",
+            expand=True,
+            padx=8,
+            pady=(8, 4),
         )
         text_widget.insert("1.0", text)
         text_widget.mark_set("insert", "end-1c")
@@ -1516,9 +1944,7 @@ class CapsuleOverlay:
                 persona_action = f"persona:{pid}"
                 text_widget.bind(
                     f"<Control-Key-{key_num}>",
-                    lambda e, a=persona_action: (
-                        self._resolve_staging(a), "break"
-                    )[-1],
+                    lambda e, a=persona_action: (self._resolve_staging(a), "break")[-1],
                 )
 
         # Hint bar.
@@ -1528,9 +1954,15 @@ class CapsuleOverlay:
                 shortcut_hint = "Ctrl+1"
             else:
                 shortcut_hint = f"Ctrl+1~{n}"
-            hint_text = t("overlay.staging.hint_with_personas", shortcut=shortcut_hint)
+            hint_text = t(
+                "overlay.staging.hint_with_personas",
+                default="{shortcut} 精炼 | Shift+Enter 原文",
+                shortcut=shortcut_hint,
+            )
         else:
-            hint_text = t("overlay.staging.hint")
+            hint_text = t(
+                "overlay.staging.hint", default="Enter 精炼 | Shift+Enter 原文 | Esc 取消"
+            )
         hint = tk.Label(
             inner,
             text=hint_text,
@@ -1595,7 +2027,8 @@ class CapsuleOverlay:
         """Collect text from the widget, hide window, and signal the pipeline."""
         if self._staging_text_widget is not None and action != "cancel":
             self._staging_result_text = self._staging_text_widget.get(
-                "1.0", "end-1c",
+                "1.0",
+                "end-1c",
             ).strip()
         else:
             self._staging_result_text = ""
@@ -1633,10 +2066,7 @@ class CapsuleOverlay:
         win.attributes("-topmost", True)
         win.attributes("-alpha", 0.75)
 
-        try:
-            set_window_noactivate(win)
-        except Exception:
-            logger.debug("set_window_noactivate failed on ghost menu")
+        _apply_noactivate(win, "ghost menu")
 
         # Collapsed state: small icon button with thin white border.
         border_frame = tk.Frame(win, bg="#555555", padx=1, pady=1)
@@ -1647,7 +2077,7 @@ class CapsuleOverlay:
 
         icon_label = tk.Label(
             frame,
-            text=t("ghost.icon"),
+            text=t("ghost.icon", default="↩"),
             font=("Segoe UI", 13),
             bg="#2a2a2a",
             fg="#888888",
@@ -1664,7 +2094,7 @@ class CapsuleOverlay:
         # Menu buttons.
         btn_use_raw = tk.Label(
             menu_frame,
-            text=f" {t('ghost.raw')} ",
+            text=f" {t('ghost.raw', default='原文替换 Raw')} ",
             font=("Segoe UI", 9),
             bg="#3a3a3a",
             fg="#c0c0c0",
@@ -1678,15 +2108,17 @@ class CapsuleOverlay:
             lambda e: self._on_ghost_action("use_raw"),
         )
         btn_use_raw.bind(
-            "<Enter>", lambda e: btn_use_raw.configure(bg="#4a4a4a", fg="#ffffff"),
+            "<Enter>",
+            lambda e: btn_use_raw.configure(bg="#4a4a4a", fg="#ffffff"),
         )
         btn_use_raw.bind(
-            "<Leave>", lambda e: btn_use_raw.configure(bg="#3a3a3a", fg="#c0c0c0"),
+            "<Leave>",
+            lambda e: btn_use_raw.configure(bg="#3a3a3a", fg="#c0c0c0"),
         )
 
         btn_regen = tk.Label(
             menu_frame,
-            text=f" {t('ghost.redo')} ",
+            text=f" {t('ghost.redo', default='重新生成 Redo')} ",
             font=("Segoe UI", 9),
             bg="#3a3a3a",
             fg="#c0c0c0",
@@ -1700,15 +2132,17 @@ class CapsuleOverlay:
             lambda e: self._on_ghost_action("regenerate"),
         )
         btn_regen.bind(
-            "<Enter>", lambda e: btn_regen.configure(bg="#4a4a4a", fg="#ffffff"),
+            "<Enter>",
+            lambda e: btn_regen.configure(bg="#4a4a4a", fg="#ffffff"),
         )
         btn_regen.bind(
-            "<Leave>", lambda e: btn_regen.configure(bg="#3a3a3a", fg="#c0c0c0"),
+            "<Leave>",
+            lambda e: btn_regen.configure(bg="#3a3a3a", fg="#c0c0c0"),
         )
 
         btn_revert = tk.Label(
             menu_frame,
-            text=f" {t('ghost.edit')} ",
+            text=f" {t('ghost.edit', default='撤回编辑 Edit')} ",
             font=("Segoe UI", 9),
             bg="#3a3a3a",
             fg="#c0c0c0",
@@ -1722,15 +2156,17 @@ class CapsuleOverlay:
             lambda e: self._on_ghost_action("revert"),
         )
         btn_revert.bind(
-            "<Enter>", lambda e: btn_revert.configure(bg="#4a4a4a", fg="#ffffff"),
+            "<Enter>",
+            lambda e: btn_revert.configure(bg="#4a4a4a", fg="#ffffff"),
         )
         btn_revert.bind(
-            "<Leave>", lambda e: btn_revert.configure(bg="#3a3a3a", fg="#c0c0c0"),
+            "<Leave>",
+            lambda e: btn_revert.configure(bg="#3a3a3a", fg="#c0c0c0"),
         )
 
         btn_dismiss = tk.Label(
             menu_frame,
-            text=f" × {t('ghost.close')} ",
+            text=f" × {t('ghost.close', default='关闭')} ",
             font=("Segoe UI", 9),
             bg="#3a3a3a",
             fg="#c0c0c0",
@@ -1744,10 +2180,12 @@ class CapsuleOverlay:
             lambda e: self._do_hide_ghost_menu(),
         )
         btn_dismiss.bind(
-            "<Enter>", lambda e: btn_dismiss.configure(bg="#4a4a4a", fg="#ff6666"),
+            "<Enter>",
+            lambda e: btn_dismiss.configure(bg="#4a4a4a", fg="#ff6666"),
         )
         btn_dismiss.bind(
-            "<Leave>", lambda e: btn_dismiss.configure(bg="#3a3a3a", fg="#c0c0c0"),
+            "<Leave>",
+            lambda e: btn_dismiss.configure(bg="#3a3a3a", fg="#c0c0c0"),
         )
 
         self._ghost_expanded = False
@@ -1755,8 +2193,15 @@ class CapsuleOverlay:
 
         # Hover to expand/collapse — bind on all widgets.
         all_hover_widgets = (
-            win, border_frame, frame, icon_label,
-            menu_frame, btn_use_raw, btn_regen, btn_revert, btn_dismiss,
+            win,
+            border_frame,
+            frame,
+            icon_label,
+            menu_frame,
+            btn_use_raw,
+            btn_regen,
+            btn_revert,
+            btn_dismiss,
         )
         for widget in all_hover_widgets:
             widget.bind("<Enter>", self._on_ghost_enter)
@@ -1781,7 +2226,8 @@ class CapsuleOverlay:
 
         # Auto-dismiss safety net: 30 seconds.
         self._ghost_auto_dismiss_timer = win.after(
-            30_000, self._do_hide_ghost_menu,
+            30_000,
+            self._do_hide_ghost_menu,
         )
 
         # Start keyboard/mouse listeners to dismiss on any user activity.
@@ -1816,7 +2262,8 @@ class CapsuleOverlay:
                 except Exception:
                     pass
             self._ghost_hover_timer = self._ghost_window.after(
-                500, self._ghost_collapse,
+                500,
+                self._ghost_collapse,
             )
 
     def _ghost_collapse(self) -> None:
@@ -1887,7 +2334,10 @@ class CapsuleOverlay:
             return False  # stop listener
 
         def on_mouse_click(
-            x: int, y: int, button: object, pressed: bool,
+            x: int,
+            y: int,
+            button: object,
+            pressed: bool,
         ) -> bool:
             if not pressed:
                 return True  # ignore release
@@ -1951,13 +2401,11 @@ class CapsuleOverlay:
         t = (self._anim_step * _ANIM_INTERVAL_MS / 1000.0) / _BREATHING_PERIOD
         intensity = (math.sin(t * 2 * math.pi) + 1.0) / 2.0
 
-        alpha = _CAPSULE_ALPHA_MIN + (
-            _CAPSULE_ALPHA_MAX - _CAPSULE_ALPHA_MIN
-        ) * intensity
+        alpha = _CAPSULE_ALPHA_MIN + (_CAPSULE_ALPHA_MAX - _CAPSULE_ALPHA_MIN) * intensity
         win.attributes("-alpha", alpha)
 
         self._anim_step += 1
-        root.after(_ANIM_INTERVAL_MS, self._animate_breathing)
+        self._anim_timer = root.after(_ANIM_INTERVAL_MS, self._animate_breathing)
 
 
 # ---------------------------------------------------------------------------
@@ -1967,23 +2415,40 @@ class CapsuleOverlay:
 
 def _draw_rounded_rect(
     canvas: tk.Canvas,
-    x1: int, y1: int, x2: int, y2: int, r: int,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    r: int,
     **kwargs,
 ) -> int:
     """Draw a rounded rectangle on *canvas* and return its item id."""
     points = [
-        x1 + r, y1,
-        x2 - r, y1,
-        x2, y1,
-        x2, y1 + r,
-        x2, y2 - r,
-        x2, y2,
-        x2 - r, y2,
-        x1 + r, y2,
-        x1, y2,
-        x1, y2 - r,
-        x1, y1 + r,
-        x1, y1,
-        x1 + r, y1,
+        x1 + r,
+        y1,
+        x2 - r,
+        y1,
+        x2,
+        y1,
+        x2,
+        y1 + r,
+        x2,
+        y2 - r,
+        x2,
+        y2,
+        x2 - r,
+        y2,
+        x1 + r,
+        y2,
+        x1,
+        y2,
+        x1,
+        y2 - r,
+        x1,
+        y1 + r,
+        x1,
+        y1,
+        x1 + r,
+        y1,
     ]
     return canvas.create_polygon(points, smooth=True, **kwargs)

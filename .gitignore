@@ -3,10 +3,17 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.dll
+*.dylib
 *.egg-info/
 *.egg
 dist/
 build/
+
+# PyInstaller
+*.manifest
+*.spec
+!untype.spec  # Keep the main spec file
 
 # Virtual environments
 .venv/
@@ -36,3 +43,9 @@ Desktop.ini
 test_stt_api.py
 Task.md
 CLAUDE.md
+.env
+*.log
+
+# Test coverage
+coverage.xml
+htmlcov/

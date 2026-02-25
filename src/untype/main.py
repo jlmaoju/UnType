@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import logging
+import logging.handlers
+import os
 import threading
 import time
 
@@ -79,6 +81,11 @@ class UnTypeApp:
         # Emergency stop: set to abort the pipeline at the next checkpoint.
         self._cancel_requested = threading.Event()
 
+        # -- Recording timeout protection ------------------------------------
+        self._timeout_timer: threading.Thread | None = None  # Timer thread for duration check
+        self._stop_timeout_timer = threading.Event()  # Signal to stop the timer
+        self._stop_timeout_timer.set()  # Initially "stopped"
+
         # -- Last interaction state (for ghost menu revert/regenerate) ------
         self._last_raw_text: str | None = None
         self._last_result: str | None = None
@@ -106,6 +113,7 @@ class UnTypeApp:
             on_press=self._on_hotkey_press,
             on_release=self._on_hotkey_release,
             mode=self._config.hotkey.mode,
+            on_escape=self._on_cancel,
         )
 
         logger.info("Initialising system tray...")
@@ -137,6 +145,23 @@ class UnTypeApp:
         self._digit_interceptor = DigitKeyInterceptor(
             on_digit=self._on_digit_during_recording,
         )
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _start_daemon_thread(self, target, name: str) -> None:
+        """Start a daemon thread with consistent naming convention.
+
+        Args:
+            target: The callable to run in the thread.
+            name: The thread name suffix (will be prefixed with "untype-").
+        """
+        threading.Thread(
+            target=target,
+            name=f"untype-{name}",
+            daemon=True,
+        ).start()
 
     # ------------------------------------------------------------------
     # Public API
@@ -199,26 +224,26 @@ class UnTypeApp:
 
         self._press_active = True
         self._recording_started.clear()
-        threading.Thread(
-            target=self._start_recording,
-            name="untype-rec-start",
-            daemon=True,
-        ).start()
+        self._start_daemon_thread(self._start_recording, "rec-start")
 
     def _on_hotkey_release(self) -> None:
         """Called when the push-to-talk hotkey is released.
 
         Spawns a background thread to run the rest of the pipeline so that
         the hotkey listener is not blocked.
+
+        IMPORTANT: We ALWAYS start a thread to ensure _pipeline_lock gets released,
+        even if _press_active was already set to False by _on_cancel (cancel scenario).
         """
-        if not self._press_active:
-            return
+        was_active = self._press_active
         self._press_active = False
-        threading.Thread(
-            target=self._process_pipeline,
-            name="untype-pipeline",
-            daemon=True,
-        ).start()
+        # Only start pipeline if this was a genuine hotkey press (not spurious release)
+        if was_active:
+            self._start_daemon_thread(self._process_pipeline, "pipeline")
+        else:
+            # Hotkey released but press was already cancelled - start cleanup-only thread
+            # to ensure the lock gets released
+            self._start_daemon_thread(self._cleanup_after_cancel, "cleanup-after-cancel")
 
     # ------------------------------------------------------------------
     # Emergency stop
@@ -229,16 +254,14 @@ class UnTypeApp:
         logger.info("Cancel requested by user")
         self._cancel_requested.set()
 
+        # Stop timeout monitor
+        self._stop_timeout_monitor()
+
         # Reset hotkey toggle state so next F6 starts a fresh recording.
         self._hotkey.reset_toggle()
-        self._press_active = False
 
-        # Stop recorder if currently recording.
-        if self._recorder.is_recording:
-            try:
-                self._recorder.stop()
-            except Exception:
-                pass
+        # Note: Don't call recorder.stop() here - it can deadlock if the audio
+        # callback is in progress. Let the pipeline thread handle cleanup.
 
         # Deactivate digit interceptor.
         self._digit_interceptor.set_active(False)
@@ -258,6 +281,48 @@ class UnTypeApp:
 
         # Update tray status.
         self._tray.update_status("Ready")
+
+        # CRITICAL: If user cancelled while still holding the hotkey,
+        # start cleanup immediately instead of waiting for hotkey release.
+        if self._press_active:
+            logger.info("Starting immediate cleanup (hotkey still held)")
+            self._start_daemon_thread(self._cleanup_after_cancel, "cleanup-after-cancel")
+
+    def _cleanup_after_cancel(self) -> None:
+        """Cleanup-only variant of _process_pipeline for cancel scenarios.
+
+        This is called from _on_hotkey_release when the hotkey is released
+        but _press_active was already False (meaning _on_cancel was called
+        before release). Its only job is to ensure _pipeline_lock is released.
+
+        The real cleanup work is already done by _on_cancel; this just waits
+        for _start_recording to finish and then releases the lock.
+        """
+        try:
+            # Wait for _start_recording to finish (up to 5 seconds)
+            if not self._recording_started.wait(timeout=5.0):
+                logger.warning("Cleanup after cancel: timeout waiting for recording start")
+
+            # CRITICAL: Ensure recorder is stopped even if _process_pipeline won't run
+            if self._recorder.is_recording:
+                try:
+                    self._recorder.abort()
+                except Exception:
+                    pass
+
+            # Also stop realtime STT session if active
+            try:
+                if isinstance(self._stt, STTRealtimeApiEngine):
+                    self._stt.stop_session()
+            except Exception:
+                pass
+        finally:
+            # Always release the lock
+            self._hwnd_watch_active = False
+            self._digit_interceptor.set_active(False)
+            self._cancel_requested.clear()
+            self._pipeline_lock.release()
+            logger.debug("Cleanup after cancel: lock released")
 
     # ------------------------------------------------------------------
     # Recording start (runs on a worker thread, NOT the hook thread)
@@ -304,6 +369,9 @@ class UnTypeApp:
             self._tray.update_status("Recording...")
             self._overlay.show(self._caret_x, self._caret_y, "Recording...")
 
+            # Start the timeout monitor thread
+            self._start_timeout_monitor()
+
             # Show recording persona bar (if personas configured).
             self._preselected_persona = None
             if self._personas:
@@ -316,12 +384,15 @@ class UnTypeApp:
                 )
                 self._digit_interceptor.set_active(True)
 
-            # Start realtime recognition session if using realtime_api backend.
-            if self._config.stt.backend == "realtime_api":
-                logger.info("Starting realtime recognition session...")
-                if isinstance(self._stt, STTRealtimeApiEngine):
-                    self._stt.start_recording_session()
-                self._overlay.show_realtime_preview(self._caret_x, self._caret_y)
+                # Auto-select the remembered persona (if any and exists)
+                last_id = self._config.last_selected_persona
+                if last_id:
+                    for idx, p in enumerate(self._personas):
+                        if p.id == last_id:
+                            self._preselected_persona = p
+                            self._overlay.select_recording_persona(idx)
+                            logger.info("Auto-selected remembered persona: %s", p.name)
+                            break
 
             # Grab selected text to determine the interaction mode.
             # This happens while recording is already running.
@@ -337,13 +408,37 @@ class UnTypeApp:
 
             # Start continuous HWND monitoring.
             self._start_hwnd_watcher()
+
+            # Start realtime recognition session AFTER _recording_started is set,
+            # in a separate thread to avoid blocking. This allows the pipeline to
+            # check for cancellation before the WebSocket connection is established.
+            if self._config.stt.backend == "realtime_api":
+
+                def _start_realtime_session():
+                    if not self._cancel_requested.is_set():
+                        try:
+                            logger.info("Starting realtime recognition session...")
+                            if isinstance(self._stt, STTRealtimeApiEngine):
+                                self._stt.start_recording_session()
+                                self._overlay.show_realtime_preview(self._caret_x, self._caret_y)
+                        except Exception as e:
+                            logger.warning("Failed to start realtime STT session: %s", e)
+
+                threading.Thread(
+                    target=_start_realtime_session,
+                    daemon=True,
+                    name="untype-start-realtime",
+                ).start()
+
         except Exception:
             logger.exception("Error starting recording")
             self._tray.update_status("Error")
             self._overlay.update_status("Error")
         finally:
             # Always signal so the pipeline thread never hangs.
+            logger.debug("_start_recording: setting _recording_started event")
             self._recording_started.set()
+            logger.debug("_start_recording: _recording_started event set")
 
     # ------------------------------------------------------------------
     # Pipeline
@@ -351,13 +446,47 @@ class UnTypeApp:
 
     def _process_pipeline(self) -> None:
         """Run the full STT -> staging -> (optional LLM) -> inject pipeline."""
+        logger.debug("_process_pipeline: starting, waiting for _recording_started")
         try:
             # Wait for the recording-start thread to finish its work.
-            self._recording_started.wait(timeout=10.0)
+            if not self._recording_started.wait(timeout=10.0):
+                # Timeout occurred - recording thread crashed or hung
+                logger.error("Timeout waiting for recording to start - aborting pipeline")
+                self._digit_interceptor.set_active(False)
+                self._overlay.hide_recording_personas()
+                self._tray.update_status("Error")
+                self._overlay.update_status("Timeout")
+                self._overlay.hide()
+                return
+
+            logger.debug("_process_pipeline: _recording_started is set, checking cancel flag")
 
             # Checkpoint: cancel requested during recording start?
             if self._cancel_requested.is_set():
-                logger.info("Pipeline cancelled after recording start")
+                logger.info("Pipeline cancelled after recording start - initiating cleanup")
+                # CRITICAL: Must abort the recorder immediately when cancelled
+                # Use ThreadPoolExecutor with timeout to avoid blocking
+                import concurrent.futures
+
+                def _cleanup_resources():
+                    if self._recorder.is_recording:
+                        logger.debug("Cleanup: aborting recorder")
+                        self._recorder.abort()
+                    if isinstance(self._stt, STTRealtimeApiEngine):
+                        logger.debug("Cleanup: stopping STT session")
+                        self._stt.stop_session()
+                    logger.debug("Cleanup: complete")
+
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                try:
+                    future = executor.submit(_cleanup_resources)
+                    future.result(timeout=2.0)  # Max 2 seconds for cleanup
+                except concurrent.futures.TimeoutError:
+                    logger.warning("Cleanup timed out - proceeding anyway")
+                except Exception as e:
+                    logger.warning("Cleanup error: %s", e)
+                finally:
+                    executor.shutdown(wait=False)
                 return
 
             if not self._recorder.is_recording:
@@ -368,8 +497,42 @@ class UnTypeApp:
                 self._overlay.hide()
                 return
 
+            # Checkpoint: cancel requested before stopping recording?
+            if self._cancel_requested.is_set():
+                logger.info("Pipeline cancelled before recording stop - initiating cleanup")
+                # CRITICAL: Must abort the recorder immediately when cancelled
+                # Use ThreadPoolExecutor with timeout to avoid blocking
+                import concurrent.futures
+
+                def _cleanup_resources():
+                    if self._recorder.is_recording:
+                        logger.debug("Cleanup: aborting recorder")
+                        self._recorder.abort()
+                    if isinstance(self._stt, STTRealtimeApiEngine):
+                        logger.debug("Cleanup: stopping STT session")
+                        self._stt.stop_session()
+
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                try:
+                    future = executor.submit(_cleanup_resources)
+                    future.result(timeout=2.0)  # Max 2 seconds for cleanup
+                except concurrent.futures.TimeoutError:
+                    logger.warning("Cleanup timed out - proceeding anyway")
+                except Exception as e:
+                    logger.warning("Cleanup error: %s", e)
+                finally:
+                    executor.shutdown(wait=False)
+
+                self._digit_interceptor.set_active(False)
+                self._overlay.hide_recording_personas()
+                self._overlay.hide_realtime_preview()
+                self._tray.update_status("Ready")
+                self._overlay.hide()
+                return
+
             # 1. Stop recording and retrieve audio.
             logger.info("Stopping audio recording...")
+            self._stop_timeout_monitor()  # Stop timeout monitor before stopping recorder
             audio = self._recorder.stop()
 
             # Checkpoint: cancel requested during recording stop?
@@ -387,12 +550,37 @@ class UnTypeApp:
                 return
 
             # 2. Transcribe (or get realtime result).
+            # IMPORTANT: Check cancel before STT processing
+            if self._cancel_requested.is_set():
+                logger.info("Pipeline cancelled before STT processing")
+                # Still need to cleanup
+                try:
+                    if isinstance(self._stt, STTRealtimeApiEngine):
+                        self._stt.stop_session()
+                except Exception:
+                    pass
+                self._digit_interceptor.set_active(False)
+                self._overlay.hide_recording_personas()
+                self._overlay.hide_realtime_preview()
+                self._tray.update_status("Ready")
+                self._overlay.hide()
+                return
+
             if self._config.stt.backend == "realtime_api":
-                # For realtime API, the result was already accumulated during recording.
-                # Just stop the session and get the final result.
+                # For realtime API, use ThreadPoolExecutor to prevent blocking
                 logger.info("Stopping realtime recognition session...")
                 if isinstance(self._stt, STTRealtimeApiEngine):
-                    text = self._stt.stop_session()
+                    import concurrent.futures
+
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    try:
+                        future = executor.submit(self._stt.stop_session)
+                        text = future.result(timeout=3.0)  # 3 second timeout
+                    except concurrent.futures.TimeoutError:
+                        logger.warning("STT stop_session timed out - forcing cleanup")
+                        text = self._stt.get_result()
+                    finally:
+                        executor.shutdown(wait=False)
                 else:
                     text = ""
                 text = text.strip()
@@ -455,6 +643,8 @@ class UnTypeApp:
 
         If *persona* is provided, its prompt/model/temperature/max_tokens
         overrides are passed to the LLM client for this single call.
+
+        The LLM call can be cancelled by setting _cancel_requested event.
         """
         if self._llm is None:
             logger.warning("LLM not configured — using raw transcription")
@@ -474,6 +664,9 @@ class UnTypeApp:
             if persona.max_tokens is not None:
                 overrides["max_tokens"] = persona.max_tokens
 
+        # Pass cancel_event to enable interruption
+        overrides["cancel_event"] = self._cancel_requested
+
         try:
             if self._mode == "polish":
                 logger.info("Polishing selected text with LLM...")
@@ -485,6 +678,9 @@ class UnTypeApp:
             else:
                 logger.info("Inserting text via LLM...")
                 return self._llm.insert(transcribed_text, **overrides)
+        except KeyboardInterrupt:
+            logger.info("LLM request cancelled by user")
+            raise
         except Exception:
             logger.exception("LLM request failed — falling back to raw transcription")
             return transcribed_text
@@ -517,20 +713,42 @@ class UnTypeApp:
         # Restart HWND monitoring during the LLM call.
         self._start_hwnd_watcher()
 
-        result = self._run_llm(text, persona=persona)
-
-        # Checkpoint: cancel requested during LLM call?
+        # Check if cancel was already requested before starting LLM
         if self._cancel_requested.is_set():
-            logger.info("Pipeline cancelled after LLM (fast-lane)")
+            logger.info("Pipeline cancelled before LLM call (fast-lane)")
+            self._hwnd_watch_active = False
+            self._overlay.hide()
+            self._tray.update_status("Ready")
+            return
+
+        try:
+            result = self._run_llm(text, persona=persona)
+        except KeyboardInterrupt:
+            # LLM request was cancelled by user
+            logger.info("Pipeline cancelled during LLM (fast-lane)")
+            self._hwnd_watch_active = False
+            self._overlay.hide()
+            self._tray.update_status("Ready")
+            return
+        except Exception as e:
+            logger.exception(f"Pipeline error in _process_with_personas: {e}")
+            self._hwnd_watch_active = False
+            self._overlay.hide()
+            self._tray.update_status("Ready")
+            return
+
+        # IMPORTANT: Check cancel again immediately after LLM returns
+        # User may have cancelled while LLM was processing (HTTP may have completed)
+        if self._cancel_requested.is_set():
+            logger.info("Pipeline cancelled after LLM returned (fast-lane)")
+            self._hwnd_watch_active = False
             self._overlay.hide()
             self._tray.update_status("Ready")
             return
 
         # Stop watcher and verify window before injection.
         self._hwnd_watch_active = False
-        if self._target_window is not None and (
-            self._window_mismatch or not verify_foreground_window(self._target_window)
-        ):
+        if not self._verify_window_safety():
             logger.warning(
                 "Window changed during LLM processing — holding result",
             )
@@ -591,20 +809,33 @@ class UnTypeApp:
         # Restart HWND monitoring during the LLM call.
         self._start_hwnd_watcher()
 
-        result = self._run_llm(edited_text)
+        try:
+            result = self._run_llm(edited_text)
+        except KeyboardInterrupt:
+            # LLM request was cancelled by user
+            logger.info("Pipeline cancelled during LLM (staging)")
+            self._hwnd_watch_active = False
+            self._overlay.hide()
+            self._tray.update_status("Ready")
+            return
+        except Exception as e:
+            logger.exception(f"Pipeline error in _process_with_staging LLM: {e}")
+            self._hwnd_watch_active = False
+            self._overlay.hide()
+            self._tray.update_status("Ready")
+            return
 
-        # Checkpoint: cancel requested during LLM call?
+        # IMPORTANT: Check cancel again immediately after LLM returns
         if self._cancel_requested.is_set():
-            logger.info("Pipeline cancelled after LLM (staging)")
+            logger.info("Pipeline cancelled after LLM returned (staging)")
+            self._hwnd_watch_active = False
             self._overlay.hide()
             self._tray.update_status("Ready")
             return
 
         # Stop watcher and verify window before injection.
         self._hwnd_watch_active = False
-        if self._target_window is not None and (
-            self._window_mismatch or not verify_foreground_window(self._target_window)
-        ):
+        if not self._verify_window_safety():
             logger.warning(
                 "Window changed during LLM processing — holding result",
             )
@@ -630,29 +861,48 @@ class UnTypeApp:
         """Begin polling the foreground window on a daemon thread."""
         self._window_mismatch = False
         self._hwnd_watch_active = True
-        threading.Thread(
-            target=self._watch_hwnd,
-            name="untype-hwnd-watch",
-            daemon=True,
-        ).start()
+        self._start_daemon_thread(self._watch_hwnd, "hwnd-watch")
 
     def _watch_hwnd(self) -> None:
         """Poll foreground window every 200ms.  Triggers capsule flight on mismatch."""
-        while self._hwnd_watch_active:
-            time.sleep(0.2)
-            if not self._hwnd_watch_active:
-                break
-            if self._target_window is not None and not verify_foreground_window(
-                self._target_window
-            ):
-                self._window_mismatch = True
-                logger.info(
-                    "Window switch detected during pipeline (expected HWND=%d, title=%r)",
-                    self._target_window.hwnd,
-                    self._target_window.title,
-                )
+        try:
+            while self._hwnd_watch_active:
+                time.sleep(0.2)
+                if not self._hwnd_watch_active:
+                    break
+                if self._target_window is not None and not verify_foreground_window(
+                    self._target_window
+                ):
+                    self._window_mismatch = True
+                    logger.info(
+                        "Window switch detected during pipeline (expected HWND=%d, title=%r)",
+                        self._target_window.hwnd,
+                        self._target_window.title,
+                    )
+                    self._overlay.fly_to_corner()
+                    break
+        except Exception:
+            # Log any unexpected error and exit cleanly rather than hanging
+            logger.exception("HWND watcher thread encountered an error")
+            self._window_mismatch = True
+            try:
                 self._overlay.fly_to_corner()
-                break
+            except Exception:
+                logger.exception("Failed to fly capsule to corner during HWND watcher error")
+        finally:
+            # Ensure flag is cleared even if we exited abnormally
+            self._hwnd_watch_active = False
+
+    def _verify_window_safety(self) -> bool:
+        """Check if the target window is still safe for text injection.
+
+        Returns False if the target window is set and either:
+        - A window mismatch was previously detected, or
+        - The foreground window no longer matches the target.
+        """
+        if self._target_window is None:
+            return True
+        return not (self._window_mismatch or not verify_foreground_window(self._target_window))
 
     # ------------------------------------------------------------------
     # Hold callbacks (Phase 2 — called from overlay thread)
@@ -819,7 +1069,8 @@ class UnTypeApp:
             if action.startswith("persona:"):
                 pid = action.split(":", 1)[1]
                 persona = next(
-                    (p for p in self._personas if p.id == pid), None,
+                    (p for p in self._personas if p.id == pid),
+                    None,
                 )
                 action = "refine"
 
@@ -836,19 +1087,27 @@ class UnTypeApp:
             # Start HWND monitoring during LLM call.
             self._start_hwnd_watcher()
 
-            result = self._run_llm(edited_text, persona=persona)
+            try:
+                result = self._run_llm(edited_text, persona=persona)
+            except KeyboardInterrupt:
+                # LLM request was cancelled by user
+                logger.info("Ghost revert: LLM cancelled by user")
+                self._hwnd_watch_active = False
+                self._overlay.hide()
+                self._tray.update_status("Ready")
+                return
 
             # Stop watcher and verify window before injection.
             self._hwnd_watch_active = False
-            if self._target_window is not None and (
-                self._window_mismatch
-                or not verify_foreground_window(self._target_window)
-            ):
+            if not self._verify_window_safety():
                 logger.warning(
                     "Ghost revert: window changed during LLM — holding result",
                 )
                 self._save_interaction_state(
-                    raw_text, result, persona=persona, show_ghost=False,
+                    raw_text,
+                    result,
+                    persona=persona,
+                    show_ghost=False,
                 )
                 self._held_result = result
                 self._held_clipboard = self._original_clipboard
@@ -908,19 +1167,27 @@ class UnTypeApp:
             # Start HWND monitoring during LLM call.
             self._start_hwnd_watcher()
 
-            result = self._run_llm(raw_text, persona=persona)
+            try:
+                result = self._run_llm(raw_text, persona=persona)
+            except KeyboardInterrupt:
+                # LLM request was cancelled by user
+                logger.info("Ghost regenerate: LLM cancelled by user")
+                self._hwnd_watch_active = False
+                self._overlay.hide()
+                self._tray.update_status("Ready")
+                return
 
             # Stop watcher and verify window before injection.
             self._hwnd_watch_active = False
-            if self._target_window is not None and (
-                self._window_mismatch
-                or not verify_foreground_window(self._target_window)
-            ):
+            if not self._verify_window_safety():
                 logger.warning(
                     "Ghost regenerate: window changed during LLM — holding result",
                 )
                 self._save_interaction_state(
-                    raw_text, result, persona=persona, show_ghost=False,
+                    raw_text,
+                    result,
+                    persona=persona,
+                    show_ghost=False,
                 )
                 self._held_result = result
                 self._held_clipboard = self._original_clipboard
@@ -988,9 +1255,28 @@ class UnTypeApp:
                 # Toggle off: pressing the same digit again deselects.
                 self._preselected_persona = None
                 self._overlay.select_recording_persona(-1)
+                self._save_selected_persona(None)
             else:
                 self._preselected_persona = self._personas[idx]
                 self._overlay.select_recording_persona(idx)
+                self._save_selected_persona(self._personas[idx].id)
+
+    def _save_selected_persona(self, persona_id: str | None) -> None:
+        """Save the selected persona ID to config."""
+        from untype.config import save_config
+
+        # Save "default" as empty string (the actual default)
+        if persona_id == "default":
+            persona_id = None
+
+        self._config.last_selected_persona = persona_id or "default"
+        # Spawn a thread to save config without blocking
+        threading.Thread(
+            target=save_config,
+            args=(self._config,),
+            name="untype-save-persona",
+            daemon=True,
+        ).start()
 
     def _on_rec_persona_click(self, index: int) -> None:
         """Called from overlay thread when a recording persona button is clicked."""
@@ -1032,6 +1318,7 @@ class UnTypeApp:
                 on_press=self._on_hotkey_press,
                 on_release=self._on_hotkey_release,
                 mode=new_config.hotkey.mode,
+                on_escape=self._on_cancel,
             )
             self._hotkey.start()
 
@@ -1057,7 +1344,8 @@ class UnTypeApp:
             logger.info("STT settings changed — reinitialising engine...")
             old_stt = self._stt
             self._stt = self._init_stt()
-            if isinstance(old_stt, (STTApiEngine, STTRealtimeApiEngine)):
+            # Clean up old STT engine (all engines have close() method)
+            if hasattr(old_stt, "close"):
                 old_stt.close()
 
         # --- LLM client ---
@@ -1138,6 +1426,69 @@ class UnTypeApp:
             on_audio_chunk=self._on_audio_chunk,
         )
 
+    def _start_timeout_monitor(self) -> None:
+        """Start a background thread to monitor recording duration and enforce timeout."""
+        # Stop any existing timer
+        self._stop_timeout_timer.set()
+
+        # Reset the stop event for the new timer
+        self._stop_timeout_timer.clear()
+
+        # Start a new timer thread
+        self._timeout_timer = threading.Thread(
+            target=self._timeout_monitor_loop,
+            name="untype-timeout-monitor",
+            daemon=True,
+        )
+        self._timeout_timer.start()
+
+    def _stop_timeout_monitor(self) -> None:
+        """Stop the timeout monitor thread."""
+        self._stop_timeout_timer.set()
+
+    def _timeout_monitor_loop(self) -> None:
+        """Background loop that monitors recording duration and enforces timeout.
+
+        Runs every second while recording is active:
+        - Updates duration display on capsule
+        - Shows warning when approaching timeout
+        - Auto-stops recording when max duration is reached
+        """
+        from untype.audio import AudioRecorder
+
+        MAX_SECONDS = AudioRecorder.MAX_RECORDING_SECONDS  # 5 minutes
+        WARNING_SECONDS = 30  # Show warning 30 seconds before timeout
+
+        while not self._stop_timeout_timer.is_set():
+            if self._recorder.is_recording:
+                duration = self._recorder.get_duration()
+                remaining = MAX_SECONDS - duration
+
+                # Update duration display
+                warning = remaining <= WARNING_SECONDS
+                self._overlay.update_duration(duration, warning=warning)
+
+                # Log warning when approaching timeout
+                if warning and int(duration) % 10 == 0:
+                    logger.warning(
+                        "Recording duration: %.0fs (timeout in %d seconds)",
+                        duration,
+                        int(remaining),
+                    )
+
+                # Auto-stop when timeout is reached
+                if duration >= MAX_SECONDS:
+                    logger.warning(
+                        "Recording timeout reached (%d seconds), auto-stopping",
+                        MAX_SECONDS,
+                    )
+                    # Trigger cancel which will stop recording
+                    self._on_cancel()
+                    break
+
+            # Check every second
+            self._stop_timeout_timer.wait(timeout=1.0)
+
     def _on_audio_volume(self, level: float) -> None:
         """Handle audio volume update from the recorder (called from audio thread)."""
         self._overlay.update_volume(level)
@@ -1185,8 +1536,7 @@ class UnTypeApp:
                 )
             else:
                 logger.warning(
-                    "Realtime API selected but no API key configured, "
-                    "falling back to local"
+                    "Realtime API selected but no API key configured, falling back to local"
                 )
 
         logger.info("Using local STT backend (model=%s)", cfg.model_size)
@@ -1239,12 +1589,78 @@ class UnTypeApp:
 
 def main() -> None:
     """Entry point for the UnType application."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    )
+    # Setup logging
+    _setup_logging()
+
     app = UnTypeApp()
     app.run()
+
+
+def _setup_logging() -> None:
+    """Configure logging with console and file handlers.
+
+    Log files are stored in ~/.untype/logs/ with rotation to keep size manageable.
+    """
+    # Create logs directory
+    log_dir = _get_log_dir()
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Common log format
+    log_format = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+    date_format = "%Y-%m-%d %H:%M:%S"
+
+    # Root logger configuration
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    # Remove any existing handlers to avoid duplicates
+    root_logger.handlers.clear()
+
+    # Console handler (with colored output for Windows)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter(log_format, datefmt=date_format)
+    console_handler.setFormatter(console_formatter)
+    root_logger.addHandler(console_handler)
+
+    # File handler with rotation
+    # Keep 3 backup files, max 500KB each = ~2MB total
+    log_file = os.path.join(log_dir, "untype.log")
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file,
+        maxBytes=500 * 1024,  # 500KB per file
+        backupCount=3,  # Keep 3 backup files
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)  # File gets more detailed logs
+    file_formatter = logging.Formatter(log_format, datefmt=date_format)
+    file_handler.setFormatter(file_formatter)
+    root_logger.addHandler(file_handler)
+
+    logging.info("UnType starting...")
+    logging.info("Log file: %s", log_file)
+
+
+def _get_log_dir() -> str:
+    """Get the log directory path.
+
+    Returns:
+        Path to the logs directory (e.g., C:\\Users\\xxx\\.untype\\logs).
+    """
+    home = os.path.expanduser("~")
+    log_dir = os.path.join(home, ".untype", "logs")
+    return log_dir
+
+
+def get_log_file_path() -> str:
+    """Get the full path to the current log file.
+
+    This can be used to show the user where logs are stored.
+
+    Returns:
+        Full path to the untype.log file.
+    """
+    return os.path.join(_get_log_dir(), "untype.log")
 
 
 if __name__ == "__main__":

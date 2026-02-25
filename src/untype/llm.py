@@ -1,6 +1,8 @@
 """OpenAI-compatible LLM client for text polishing and voice-to-text insertion."""
 
+import concurrent.futures
 import logging
+import threading
 
 import httpx
 
@@ -78,6 +80,7 @@ class LLMClient:
                 "Content-Type": "application/json",
             },
             timeout=httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=30.0),
+            verify=True,
         )
 
     # ------------------------------------------------------------------
@@ -93,11 +96,15 @@ class LLMClient:
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> str:
         """Refine *original_text* according to a voice *instruction*.
 
         Optional keyword arguments override instance defaults for this
         single call (used by the persona system).
+
+        Args:
+            cancel_event: If provided, request can be cancelled by setting this event.
         """
         user_message = (
             f"<original_text>\n{original_text}\n</original_text>\n\n"
@@ -109,6 +116,7 @@ class LLMClient:
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
+            cancel_event=cancel_event,
         )
 
     def insert(
@@ -119,11 +127,15 @@ class LLMClient:
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> str:
         """Convert raw *spoken_text* into well-formed written text.
 
         Optional keyword arguments override instance defaults for this
         single call (used by the persona system).
+
+        Args:
+            cancel_event: If provided, request can be cancelled by setting this event.
         """
         user_message = f"<transcription>\n{spoken_text}\n</transcription>"
         return self._chat(
@@ -132,6 +144,7 @@ class LLMClient:
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
+            cancel_event=cancel_event,
         )
 
     # ------------------------------------------------------------------
@@ -146,15 +159,21 @@ class LLMClient:
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> str:
         """Send a chat-completion request and return the assistant content.
 
         Per-call *model*, *temperature*, and *max_tokens* override instance
         defaults when provided (non-``None``).
 
+        If *cancel_event* is provided, the request can be cancelled by
+        setting the event before it completes.
+
         Raises:
             httpx.HTTPStatusError: On 4xx / 5xx responses.
             KeyError / IndexError: If the response body is malformed.
+            httpx.TimeoutException: On timeout.
+            KeyboardInterrupt: If the request is cancelled via *cancel_event*.
         """
         payload = {
             "model": model or self.model,
@@ -166,6 +185,65 @@ class LLMClient:
             "max_tokens": max_tokens if max_tokens is not None else self.max_tokens,
         }
 
+        # If no cancel event, use simple synchronous request
+        if cancel_event is None:
+            return self._do_request(payload)
+
+        # With cancel event, use ThreadPoolExecutor with timeout
+        # This allows us to cancel even if the HTTP request is blocking
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+        def _do_request_wrapper():
+            return self._do_request(payload)
+
+        try:
+            # Submit the request
+            future = executor.submit(_do_request_wrapper)
+
+            # Poll for completion or cancellation (100ms intervals)
+            while not future.done():
+                if cancel_event.is_set():
+                    # Cancel the future
+                    future.cancel()
+                    # Try to close the client to abort the connection
+                    try:
+                        self._client.close()
+                    except Exception:
+                        pass
+                    # Shutdown the executor
+                    executor.shutdown(wait=False)
+                    raise KeyboardInterrupt("LLM request cancelled")
+
+                # Wait a bit before checking again
+                try:
+                    future.result(timeout=0.1)
+                except concurrent.futures.TimeoutError:
+                    continue
+                except concurrent.futures.CancelledError:
+                    raise KeyboardInterrupt("LLM request cancelled")
+
+            # Get the result
+            return future.result()
+
+        except KeyboardInterrupt:
+            raise
+        except concurrent.futures.CancelledError:
+            raise KeyboardInterrupt("LLM request cancelled")
+        except Exception:
+            # Re-raise any other exception
+            raise
+        finally:
+            # Always shutdown the executor
+            try:
+                executor.shutdown(wait=False)
+            except Exception:
+                pass
+
+    def _do_request(self, payload: dict) -> str:
+        """Perform the actual HTTP request.
+
+        Separated so it can be run in a thread for cancellation support.
+        """
         response = None
         try:
             response = self._client.post("/chat/completions", json=payload)
@@ -173,9 +251,7 @@ class LLMClient:
             data = response.json()
             return data["choices"][0]["message"]["content"]
         except httpx.HTTPStatusError as exc:
-            logger.error(
-                "LLM API HTTP error %s: %s", exc.response.status_code, exc.response.text
-            )
+            logger.error("LLM API HTTP error %s: %s", exc.response.status_code, exc.response.text)
             raise
         except (KeyError, IndexError, ValueError) as exc:
             # ValueError covers json.JSONDecodeError (empty / invalid body)

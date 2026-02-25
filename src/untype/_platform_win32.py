@@ -64,15 +64,28 @@ def get_caret_screen_position() -> CaretPosition:
     """
     # Try GetGUIThreadInfo for the foreground thread.
     hwnd = user32.GetForegroundWindow()
+
+    # Validate HWND before using it
+    if not hwnd or not user32.IsWindow(hwnd):
+        logger.debug("get_caret_screen_position: invalid HWND, falling back to mouse")
+        pt = POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+        return CaretPosition(x=pt.x, y=pt.y, found=False)
+
     tid = user32.GetWindowThreadProcessId(hwnd, None)
+    if not tid:
+        logger.debug("get_caret_screen_position: failed to get thread ID, falling back to mouse")
+        pt = POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+        return CaretPosition(x=pt.x, y=pt.y, found=False)
 
     gui = GUITHREADINFO()
     gui.cbSize = ctypes.sizeof(GUITHREADINFO)
 
     if user32.GetGUIThreadInfo(tid, ctypes.byref(gui)) and gui.hwndCaret:
         pt = POINT(gui.rcCaret.left, gui.rcCaret.top)
-        user32.ClientToScreen(gui.hwndCaret, ctypes.byref(pt))
-        return CaretPosition(x=pt.x, y=pt.y, found=True)
+        if user32.ClientToScreen(gui.hwndCaret, ctypes.byref(pt)):
+            return CaretPosition(x=pt.x, y=pt.y, found=True)
 
     # Fallback: mouse cursor position.
     pt = POINT()
@@ -86,8 +99,17 @@ def get_caret_screen_position() -> CaretPosition:
 
 
 def get_foreground_window() -> WindowIdentity:
-    """Take a snapshot of the current foreground window (HWND + PID + title)."""
+    """Take a snapshot of the current foreground window (HWND + PID + title).
+
+    Returns an empty WindowIdentity (hwnd=0, title="", pid=0) if no valid
+    foreground window exists.
+    """
     hwnd = user32.GetForegroundWindow()
+
+    # Validate HWND before using it
+    if not hwnd or not user32.IsWindow(hwnd):
+        logger.debug("get_foreground_window: invalid HWND returned")
+        return WindowIdentity(hwnd=0, title="", pid=0)
 
     # Window title.
     length = user32.GetWindowTextLengthW(hwnd)
@@ -172,8 +194,8 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
 
 
 HOOKPROC = ctypes.WINFUNCTYPE(
-    ctypes.c_long,           # return LRESULT
-    ctypes.c_int,            # nCode
+    ctypes.c_long,  # return LRESULT
+    ctypes.c_int,  # nCode
     ctypes.wintypes.WPARAM,  # wParam
     ctypes.wintypes.LPARAM,  # lParam
 )
@@ -183,11 +205,17 @@ HOOKPROC = ctypes.WINFUNCTYPE(
 # our HOOKPROC definition.
 _hook_user32 = ctypes.WinDLL("user32", use_last_error=True)
 _hook_user32.SetWindowsHookExW.argtypes = [
-    ctypes.c_int, HOOKPROC, ctypes.wintypes.HINSTANCE, ctypes.wintypes.DWORD,
+    ctypes.c_int,
+    HOOKPROC,
+    ctypes.wintypes.HINSTANCE,
+    ctypes.wintypes.DWORD,
 ]
 _hook_user32.SetWindowsHookExW.restype = ctypes.c_void_p
 _hook_user32.CallNextHookEx.argtypes = [
-    ctypes.c_void_p, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
+    ctypes.c_void_p,
+    ctypes.c_int,
+    ctypes.wintypes.WPARAM,
+    ctypes.wintypes.LPARAM,
 ]
 _hook_user32.CallNextHookEx.restype = ctypes.c_long
 _hook_user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
@@ -230,12 +258,16 @@ class DigitKeyInterceptor:
         ready.wait(timeout=5.0)
 
     def stop(self) -> None:
-        """Post ``WM_QUIT`` to the hook thread's message pump."""
+        """Post ``WM_QUIT`` to the hook thread's message pump and wait for cleanup."""
         tid = self._thread_id
+        thread = self._thread
         if tid is not None:
             user32.PostThreadMessageW(tid, WM_QUIT, 0, 0)
             self._thread_id = None
             self._thread = None
+            # Wait for the thread to actually terminate.
+            if thread is not None:
+                thread.join(timeout=1.0)
 
     def set_active(self, active: bool) -> None:
         self._active = active
@@ -252,17 +284,25 @@ class DigitKeyInterceptor:
                         self._on_digit(digit)
                     except Exception:
                         logger.debug(
-                            "on_digit callback error for digit %d", digit,
+                            "on_digit callback error for digit %d",
+                            digit,
                             exc_info=True,
                         )
                     return 1  # suppress this key event
-        return _hook_user32.CallNextHookEx(self._hook, nCode, wParam, lParam)
+        # Safe hook call with null check
+        hook = self._hook
+        if hook:
+            return _hook_user32.CallNextHookEx(hook, nCode, wParam, lParam)
+        return 0
 
     def _run(self, ready: threading.Event) -> None:
         """Thread entry: install hook, pump messages, unhook on WM_QUIT."""
         self._thread_id = kernel32.GetCurrentThreadId()
         self._hook = _hook_user32.SetWindowsHookExW(
-            WH_KEYBOARD_LL, self._hook_proc, None, 0,
+            WH_KEYBOARD_LL,
+            self._hook_proc,
+            None,
+            0,
         )
         if not self._hook:
             logger.error("SetWindowsHookExW failed for digit interceptor")

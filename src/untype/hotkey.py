@@ -103,9 +103,7 @@ def parse_hotkey(hotkey_str: str) -> tuple[set[str], keyboard.KeyCode | keyboard
     elif len(trigger_part) == 1:
         trigger = keyboard.KeyCode.from_char(trigger_part)
     else:
-        raise ValueError(
-            f"Unknown trigger key {trigger_part!r} in hotkey {hotkey_str!r}"
-        )
+        raise ValueError(f"Unknown trigger key {trigger_part!r} in hotkey {hotkey_str!r}")
 
     return modifiers, trigger
 
@@ -118,6 +116,8 @@ class HotkeyListener:
 
     In **toggle** mode: the first press calls *on_press*, the second press
     calls *on_release*.  Key release events are ignored.
+
+    Pressing Escape at any time calls *on_escape* (if provided).
     """
 
     def __init__(
@@ -126,10 +126,12 @@ class HotkeyListener:
         on_press: Callable[[], None],
         on_release: Callable[[], None],
         mode: str = "toggle",
+        on_escape: Callable[[], None] | None = None,
     ) -> None:
         self._modifiers, self._trigger = parse_hotkey(hotkey_str)
         self._on_press = on_press
         self._on_release = on_release
+        self._on_escape = on_escape
         self._hotkey_str = hotkey_str
         self._mode = mode  # "hold" or "toggle"
 
@@ -216,39 +218,52 @@ class HotkeyListener:
     def _on_key_press(self, key: keyboard.Key | keyboard.KeyCode) -> None:
         fire_press = False
         fire_release = False
+        fire_escape = False
 
         with self._lock:
-            mod = self._normalize_modifier(key)
-            if mod is not None:
-                self._held_modifiers.add(mod)
-
-            if self._is_trigger(key):
-                self._trigger_held = True
-
-            # Check if the full hotkey combo is pressed.
-            combo_pressed = (
-                self._trigger_held
-                and self._modifiers <= self._held_modifiers
-            )
-
-            if self._mode == "toggle":
-                # Toggle mode: first press → on_press, second press → on_release.
-                # We only act on the initial combo press (not auto-repeat).
-                if combo_pressed and not self._active:
-                    self._active = True  # track physical key state
-                    if not self._toggled_on:
-                        self._toggled_on = True
-                        fire_press = True
-                    else:
-                        self._toggled_on = False
-                        fire_release = True
+            # Check for Escape key first (can cancel at any time).
+            if isinstance(key, keyboard.Key) and key == keyboard.Key.esc:
+                if self._on_escape is not None:
+                    fire_escape = True
+                # Don't process Escape further
+                fire_press = False
+                fire_release = False
             else:
-                # Hold mode: press → on_press (release handled in _on_key_release).
-                if combo_pressed and not self._active:
-                    self._active = True
-                    fire_press = True
+                mod = self._normalize_modifier(key)
+                if mod is not None:
+                    self._held_modifiers.add(mod)
+
+                if self._is_trigger(key):
+                    self._trigger_held = True
+
+                # Check if the full hotkey combo is pressed.
+                combo_pressed = self._trigger_held and self._modifiers <= self._held_modifiers
+
+                if self._mode == "toggle":
+                    # Toggle mode: first press → on_press, second press → on_release.
+                    # We only act on the initial combo press (not auto-repeat).
+                    if combo_pressed and not self._active:
+                        self._active = True  # track physical key state
+                        if not self._toggled_on:
+                            self._toggled_on = True
+                            fire_press = True
+                        else:
+                            self._toggled_on = False
+                            fire_release = True
+                else:
+                    # Hold mode: press → on_press (release handled in _on_key_release).
+                    if combo_pressed and not self._active:
+                        self._active = True
+                        fire_press = True
 
         # Fire callbacks outside the lock to avoid deadlocks.
+        if fire_escape:
+            logger.debug("Escape pressed - cancelling")
+            try:
+                self._on_escape()
+            except Exception:
+                logger.exception("Error in on_escape callback")
+
         if fire_press:
             logger.debug("Hotkey activated: %s", self._hotkey_str)
             try:

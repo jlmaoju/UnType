@@ -7,6 +7,7 @@ import logging
 import tomllib
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+from urllib.parse import urlparse
 
 import tomli_w
 
@@ -36,14 +37,14 @@ class OverlayConfig:
 @dataclass
 class AudioConfig:
     sample_rate: int = 16000
-    gain_boost: float = 3.0
+    gain_boost: float = 1.5
     device: str = ""
 
 
 @dataclass
 class STTConfig:
     # Backend: "local", "api", or "realtime_api" (Aliyun WebSocket)
-    backend: str = "api"
+    backend: str = "realtime_api"
     # Local model settings
     model_size: str = "small"
     device: str = "auto"
@@ -118,6 +119,7 @@ class AppConfig:
     stt: STTConfig = field(default_factory=STTConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     language: str = "zh"  # UI language code (e.g. "zh", "en")
+    last_selected_persona: str = "default"  # Remember user's last persona choice
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +142,30 @@ class Persona:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _is_valid_url(url: str) -> bool:
+    """Check if *url* is a valid HTTP/HTTPS URL.
+
+    Empty strings are considered valid (user hasn't configured it yet).
+    """
+    if not url:
+        return True
+    try:
+        result = urlparse(url)
+        return result.scheme in ("http", "https") and bool(result.netloc)
+    except Exception:
+        return False
+
+
+def _clamp_float(value: float, min_val: float, max_val: float) -> float:
+    """Clamp a float value to the specified range."""
+    return max(min_val, min(max_val, value))
+
+
+def _clamp_int(value: int, min_val: int, max_val: int) -> int:
+    """Clamp an int value to the specified range."""
+    return max(min_val, min(max_val, value))
 
 
 def get_config_path() -> Path:
@@ -171,13 +197,60 @@ def _dict_to_config(data: dict) -> AppConfig:
     audio = _merge_into_dataclass(AudioConfig, data.get("audio", {}))
     stt = _merge_into_dataclass(STTConfig, data.get("stt", {}))
 
+    # Validate STT backend value
+    valid_backends = {"local", "api", "realtime_api"}
+    if stt.backend not in valid_backends:
+        logger.warning(
+            "Invalid stt.backend value '%s' in config. Valid values are: %s. Defaulting to 'api'.",
+            stt.backend,
+            ", ".join(sorted(valid_backends)),
+        )
+        stt.backend = "api"
+
+    # Validate STT API URL
+    if not _is_valid_url(stt.api_base_url):
+        logger.warning("Invalid stt.api_base_url in config. Resetting to empty.")
+        stt.api_base_url = ""
+
     llm_data = data.get("llm", {})
     prompts_data = llm_data.get("prompts", {}) if isinstance(llm_data, dict) else {}
     prompts = _merge_into_dataclass(LLMPrompts, prompts_data)
+    # Merge prompts into llm data before creating LLMConfig to avoid type issues
+    if isinstance(llm_data, dict):
+        llm_data = {**llm_data, "prompts": prompts}
     llm = _merge_into_dataclass(LLMConfig, llm_data)
-    llm.prompts = prompts  # type: ignore[attr-defined]
 
-    return AppConfig(hotkey=hotkey, overlay=overlay, audio=audio, stt=stt, llm=llm)  # type: ignore[arg-type]
+    # Validate LLM base_url
+    if not _is_valid_url(llm.base_url):
+        logger.warning("Invalid llm.base_url in config. Resetting to empty.")
+        llm.base_url = ""
+
+    # Validate and clamp numeric ranges
+    # LLM temperature: 0.0 to 2.0
+    if not 0.0 <= llm.temperature <= 2.0:
+        logger.warning(
+            "llm.temperature %.2f out of range [0.0, 2.0]. Clamping.",
+            llm.temperature,
+        )
+        llm.temperature = _clamp_float(llm.temperature, 0.0, 2.0)
+
+    # Audio gain_boost: 0.1 to 10.0
+    if not 0.1 <= audio.gain_boost <= 10.0:
+        logger.warning(
+            "audio.gain_boost %.2f out of range [0.1, 10.0]. Clamping.",
+            audio.gain_boost,
+        )
+        audio.gain_boost = _clamp_float(audio.gain_boost, 0.1, 10.0)
+
+    # Audio sample_rate: 8000 to 48000
+    if not 8000 <= audio.sample_rate <= 48000:
+        logger.warning(
+            "audio.sample_rate %d out of range [8000, 48000]. Clamping.",
+            audio.sample_rate,
+        )
+        audio.sample_rate = _clamp_int(audio.sample_rate, 8000, 48000)
+
+    return AppConfig(hotkey=hotkey, overlay=overlay, audio=audio, stt=stt, llm=llm)
 
 
 def _config_to_dict(config: AppConfig) -> dict:
@@ -186,11 +259,13 @@ def _config_to_dict(config: AppConfig) -> dict:
     Filters out None values since TOML doesn't support null.
     """
     data = asdict(config)
+
     # Recursively remove None values
     def _remove_none(obj: object) -> object:
         if isinstance(obj, dict):
             return {k: _remove_none(v) for k, v in obj.items() if v is not None}
         return obj
+
     return _remove_none(data)  # type: ignore[return-value]
 
 
@@ -203,6 +278,7 @@ def load_config() -> AppConfig:
     """Load config from file, merge with defaults.
 
     Creates a default config file if one does not exist.
+    Handles corrupted TOML files gracefully.
     """
     path = get_config_path()
 
@@ -211,8 +287,14 @@ def load_config() -> AppConfig:
         save_config(config)
         return config
 
-    with open(path, "rb") as f:
-        file_data = tomllib.load(f)
+    try:
+        with open(path, "rb") as f:
+            file_data = tomllib.load(f)
+    except (tomllib.TOMLDecodeError, OSError) as e:
+        logger.error("Failed to load config from %s: %s. Using defaults.", path, e)
+        config = AppConfig()
+        save_config(config)
+        return config
 
     default_data = _config_to_dict(AppConfig())
     merged = _deep_merge(default_data, file_data)
@@ -223,13 +305,40 @@ def save_config(config: AppConfig) -> None:
     """Save *config* to the TOML config file.
 
     Creates the ~/.untype/ directory if it does not exist.
+
+    Raises:
+        OSError: If the config file cannot be written. The backup file
+            is preserved for recovery.
     """
     path = get_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Create backup if config file exists
+    backup_path = path.with_suffix(".toml.bak")
+    if path.exists():
+        import shutil
+
+        shutil.copy2(path, backup_path)
+
     data = _config_to_dict(config)
-    with open(path, "wb") as f:
-        tomli_w.dump(data, f)
+    try:
+        # Write to a temporary file first, then atomic rename
+        temp_path = path.with_suffix(".toml.tmp")
+        with open(temp_path, "wb") as f:
+            tomli_w.dump(data, f)
+
+        # Atomic replace on Windows
+        if path.exists():
+            path.unlink()
+        temp_path.replace(path)
+
+    except Exception:
+        # Restore from backup if save failed
+        if backup_path.exists():
+            import shutil
+
+            shutil.copy2(backup_path, path)
+        raise
 
 
 # ---------------------------------------------------------------------------

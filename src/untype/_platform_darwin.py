@@ -30,4 +30,4 @@ def set_window_noactivate(tk_root: tk.Tk | tk.Toplevel) -> None:
 
 
 def get_modifier_key() -> Key:
-    return Key.cmd_l
+    raise NotImplementedError("macOS support coming soon")

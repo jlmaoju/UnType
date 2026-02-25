@@ -27,7 +27,7 @@ class STTEngine:
 
     def __init__(
         self,
-        model_size: str = "large-v3",
+        model_size: str = "small",
         device: str = "auto",
         compute_type: str = "auto",
         language: str = "zh",
@@ -44,7 +44,9 @@ class STTEngine:
 
         logger.info(
             "Loading Whisper model %s on %s (%s)...",
-            model_size, device, compute_type,
+            model_size,
+            device,
+            compute_type,
         )
 
         self._model = WhisperModel(model_size, device=device, compute_type=compute_type)
@@ -76,6 +78,7 @@ class STTEngine:
     def _detect_device() -> str:
         try:
             import torch
+
             if torch.cuda.is_available():
                 return "cuda"
         except ImportError:
@@ -106,6 +109,7 @@ class STTApiEngine:
         self._client = httpx.Client(
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0),
+            verify=True,
         )
         logger.info("STT API engine ready (%s, model=%s)", self._base_url, self._model)
 
@@ -185,13 +189,17 @@ class STTRealtimeApiEngine:
 
         self._recognition = None
         self._result_queue: queue.Queue[str] = queue.Queue()
+        self._finalized_text = ""  # Accumulated completed sentences
+        self._pending_sentence = ""  # Current in-progress sentence
         self._current_text = ""
         self._lock = threading.Lock()
         self._session_active = False
 
         logger.info(
             "STT Realtime API engine ready (model=%s, format=%s, sr=%s)",
-            self._model, self._format, self._sample_rate,
+            self._model,
+            self._format,
+            self._sample_rate,
         )
 
     def transcribe(self, audio: np.ndarray) -> str:
@@ -206,13 +214,12 @@ class STTRealtimeApiEngine:
             # Send audio in chunks (100ms = 1600 samples at 16kHz)
             chunk_size = int(0.1 * self._sample_rate)
             for i in range(0, len(audio), chunk_size):
-                chunk = audio[i:i + chunk_size]
+                chunk = audio[i : i + chunk_size]
                 self.send_audio(chunk)
-            self.stop_session()
             return self.get_result()
-        except Exception:
+        finally:
+            # Ensure session is always stopped, even if get_result() raises
             self.stop_session()
-            raise
 
     def start_session(self) -> None:
         """Start a new realtime recognition session."""
@@ -222,17 +229,77 @@ class STTRealtimeApiEngine:
 
         try:
             import dashscope
-            from dashscope.audio.asr import Recognition
+            from dashscope.audio.asr import Recognition, RecognitionCallback
 
             dashscope.api_key = self._api_key
+
+            # Build inner callback class inheriting from the SDK base class
+            engine_ref = self
+
+            class _Callback(RecognitionCallback):
+                def on_open(self) -> None:
+                    logger.debug("Realtime recognition WebSocket opened")
+
+                def on_event(self, result) -> None:
+                    try:
+                        from dashscope.audio.asr import RecognitionResult
+
+                        sentence = result.get_sentence()
+                        if not isinstance(sentence, dict) or "text" not in sentence:
+                            return
+                        text = sentence["text"]
+                        if not text:
+                            return
+
+                        is_end = RecognitionResult.is_sentence_end(sentence)
+
+                        with engine_ref._lock:
+                            if is_end:
+                                # Sentence finalized — append to finalized, clear pending
+                                engine_ref._finalized_text += text
+                                engine_ref._pending_sentence = ""
+                            else:
+                                # In-progress update — replace pending sentence
+                                engine_ref._pending_sentence = text
+                            engine_ref._current_text = (
+                                engine_ref._finalized_text + engine_ref._pending_sentence
+                            )
+
+                        display_text = engine_ref._current_text
+                        if engine_ref._on_text_update:
+                            engine_ref._on_text_update(display_text)
+                        logger.debug("Realtime transcript update: %s", display_text)
+                    except Exception as exc:
+                        logger.warning("Error processing recognition event: %s", exc)
+
+                def on_complete(self) -> None:
+                    logger.debug("Realtime recognition completed")
+
+                def on_error(self, message) -> None:
+                    try:
+                        request_id = getattr(message, "request_id", "unknown")
+                        msg = getattr(message, "message", "Unknown error")
+                        logger.error(
+                            "Realtime recognition error (request_id=%s): %s",
+                            request_id,
+                            msg,
+                        )
+                    except Exception as exc:
+                        logger.error("Realtime recognition error: %s", exc)
+
+                def on_close(self) -> None:
+                    logger.debug("Realtime recognition WebSocket closed")
+
             self._recognition = Recognition(
                 model=self._model,
                 format=self._format,
                 sample_rate=self._sample_rate,
-                callback=self._RecognitionCallback(self),
+                callback=_Callback(),
             )
             self._recognition.start()
             self._session_active = True
+            self._finalized_text = ""
+            self._pending_sentence = ""
             self._current_text = ""
             logger.info("Realtime recognition session started")
         except ImportError as exc:
@@ -297,13 +364,6 @@ class STTRealtimeApiEngine:
         with self._lock:
             return self._current_text
 
-    def _update_text(self, text: str) -> None:
-        """Update the current text from callback thread."""
-        with self._lock:
-            self._current_text = text
-        if self._on_text_update:
-            self._on_text_update(text)
-
     def close(self) -> None:
         """Clean up resources."""
         if self._session_active:
@@ -313,76 +373,3 @@ class STTRealtimeApiEngine:
     @property
     def is_loaded(self) -> bool:
         return True
-
-    # -----------------------------------------------------------------------
-    # Inner callback class for DashScope Recognition
-    # -----------------------------------------------------------------------
-
-    class _RecognitionCallback:
-        """Callback handler for DashScope Recognition API."""
-
-        def __init__(self, engine: STTRealtimeApiEngine):
-            self._engine = engine
-
-        def on_open(self) -> None:
-            """Called when WebSocket connection is established."""
-            logger.debug("Realtime recognition WebSocket opened")
-
-        def on_event(self, result: object) -> None:
-            """Called when a transcription result arrives.
-
-            Args:
-                result: dashscope.audio.asr.RecognitionResult
-            """
-            try:
-                # According to DashScope docs, use get_sentence() to get the result
-                sentence = result.get_sentence()
-                if isinstance(sentence, dict) and "text" in sentence:
-                    text = sentence["text"]
-                    if text:
-                        # Check if this is a sentence end (complete sentence)
-                        # For realtime API, we accumulate all text
-                        # The service sends incremental updates
-                        with self._engine._lock:
-                            # Append new text to current result
-                            # Check if this text should be appended or replaces
-                            current = self._engine._current_text
-                            # If the new text starts with current text, it's an update
-                            # Otherwise it's a new segment to append
-                            if text.startswith(current):
-                                self._engine._current_text = text
-                            else:
-                                # New segment - append with space if needed
-                                if current and not current.endswith((" ", "，", "。", "、", ",", ".")):
-                                    self._engine._current_text = current + " " + text
-                                else:
-                                    self._engine._current_text = current + text
-
-                        # Notify callback for UI update
-                        display_text = self._engine._current_text
-                        if self._engine._on_text_update:
-                            self._engine._on_text_update(display_text)
-                        logger.debug("Realtime transcript update: %s", display_text)
-            except Exception as exc:
-                logger.warning("Error processing recognition event: %s", exc)
-
-        def on_complete(self) -> None:
-            """Called when recognition is complete."""
-            logger.debug("Realtime recognition completed")
-
-        def on_error(self, result: object) -> None:
-            """Called when an error occurs.
-
-            Args:
-                result: dashscope.audio.asr.RecognitionResult
-            """
-            try:
-                request_id = getattr(result, "request_id", "unknown")
-                message = getattr(result, "message", "Unknown error")
-                logger.error("Realtime recognition error (request_id=%s): %s", request_id, message)
-            except Exception as exc:
-                logger.error("Realtime recognition error: %s", exc)
-
-        def on_close(self) -> None:
-            """Called when WebSocket connection is closed."""
-            logger.debug("Realtime recognition WebSocket closed")

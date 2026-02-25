@@ -14,6 +14,7 @@
     "tray.status.error": "Error",
     "tray.settings": "Settings...",
     "tray.personas": "Personas...",
+    "tray.open_logs": "Open Logs...",
     "tray.quit": "Quit",
 
     "settings.title": "UnType — Settings",
@@ -30,7 +31,7 @@
     "settings.heading.stt": "Speech-to-Text",
     "settings.backend": "Backend:",
     "settings.backend.api": "API",
-    "settings.backend.local": "Local",
+    "settings.backend.local": "Local (requires download)",
     "settings.backend.realtime_api": "Realtime API (Aliyun)",
     "settings.stt_api_url": "STT API URL:",
     "settings.stt_api_key": "STT API Key:",
@@ -49,6 +50,7 @@
     "settings.language": "Language:",
     "settings.save": "Save",
     "settings.cancel": "Cancel",
+    "settings.open_logs": "Open Logs Folder",
     "settings.error.invalid_gain": "Audio gain boost must be a number.",
     "settings.error.save_failed": "Failed to save configuration file.",
 

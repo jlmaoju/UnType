@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
+import sys
 import threading
 import tkinter as tk
 from tkinter import ttk
 from typing import Callable
+from urllib.parse import urlparse
 
 import pystray
 from PIL import Image, ImageDraw
@@ -15,6 +19,31 @@ from untype.config import AppConfig, save_config
 from untype.i18n import get_locale_display_name, list_available_locales, t
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+
+def _validate_url(url: str) -> bool:
+    """Validate that a URL string is properly formatted.
+
+    Empty strings are considered valid (optional field).
+    """
+    if not url:
+        return True
+    try:
+        result = urlparse(url)
+        return all([result.scheme in ("http", "https"), result.netloc])
+    except Exception:
+        return False
+
+
+def _validate_gain(value: float) -> bool:
+    """Validate that gain_boost is within acceptable range (0.1 to 10.0)."""
+    return 0.1 <= value <= 10.0
+
 
 # ---------------------------------------------------------------------------
 # Icon colours for each application state
@@ -182,9 +211,9 @@ class SettingsDialog:
 
             for label_text, (label_widget, input_widget) in stt_field_labels.items():
                 should_show = (
-                    (label_text in api_fields and backend == "api") or
-                    (label_text in local_fields and backend == "local") or
-                    (label_text in realtime_fields and backend == "realtime_api")
+                    (label_text in api_fields and backend == "api")
+                    or (label_text in local_fields and backend == "local")
+                    or (label_text in realtime_fields and backend == "realtime_api")
                 )
                 if should_show:
                     label_widget.grid()
@@ -207,9 +236,7 @@ class SettingsDialog:
 
         # Helper to create field and track its widgets
         def _create_text_field(label: str, value: str, show: str = "") -> tk.StringVar:
-            ttk.Label(frame, text=label).grid(
-                row=row, column=0, sticky="w", padx=(0, 8), pady=2
-            )
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
             var = tk.StringVar(master=root, value=value)
             entry = ttk.Entry(frame, textvariable=var, width=48)
             if show:
@@ -223,9 +250,7 @@ class SettingsDialog:
             return var
 
         def _create_combo_field(label: str, value: str, options: list[str]) -> tk.StringVar:
-            ttk.Label(frame, text=label).grid(
-                row=row, column=0, sticky="w", padx=(0, 8), pady=2
-            )
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
             var = tk.StringVar(master=root, value=value)
             combo = ttk.Combobox(
                 frame, textvariable=var, values=options, width=45, state="readonly"
@@ -335,6 +360,11 @@ class SettingsDialog:
         )
         ttk.Button(
             btn_frame,
+            text=t("settings.open_logs"),
+            command=lambda: self._open_logs_folder(root),
+        ).pack(side="right", padx=(8, 0))
+        ttk.Button(
+            btn_frame,
             text=t("settings.save"),
             command=lambda: self._do_save(
                 root,
@@ -369,6 +399,30 @@ class SettingsDialog:
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _open_logs_folder(dialog: tk.Tk) -> None:
+        """Open the logs folder in file explorer."""
+        log_dir = SettingsDialog._get_log_dir()
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            # Open folder in default file explorer
+            if os.name == "nt":  # Windows
+                os.startfile(log_dir)
+            elif os.name == "posix":  # macOS and Linux
+                if sys.platform == "darwin":
+                    subprocess.call(["open", log_dir])
+                else:
+                    subprocess.call(["xdg-open", log_dir])
+            logger.info("Opened logs folder: %s", log_dir)
+        except Exception as e:
+            logger.exception("Failed to open logs folder: %s", e)
+
+    @staticmethod
+    def _get_log_dir() -> str:
+        """Get the log directory path."""
+        home = os.path.expanduser("~")
+        return os.path.join(home, ".untype", "logs")
 
     @staticmethod
     def _heading(parent: ttk.Frame, text: str, row: int) -> int:
@@ -458,9 +512,11 @@ class SettingsDialog:
             combo.grid(row=row, column=1, sticky="ew", pady=2)
 
             if on_change:
+
                 def _on_select_simple(_event: tk.Event) -> None:  # type: ignore[type-arg]
                     if on_change:
                         on_change(var.get())
+
                 combo.bind("<<ComboboxSelected>>", _on_select_simple)
 
         return var
@@ -486,21 +542,21 @@ class SettingsDialog:
 
     # Hotkeys that should be blocked because they conflict with system or app functions
     _BLOCKED_HOTKEYS = {
-        "ctrl+c",    # Copy - conflicts with app's own clipboard operations
-        "ctrl+v",    # Paste
-        "ctrl+x",    # Cut
-        "ctrl+z",    # Undo
-        "ctrl+y",    # Redo
-        "ctrl+a",    # Select all
-        "ctrl+s",    # Save
-        "ctrl+w",    # Close window
-        "ctrl+q",    # Quit
-        "ctrl+n",    # New
-        "ctrl+o",    # Open
-        "alt+f4",    # Close app
-        "alt+tab",   # Switch window
-        "win+l",     # Lock computer
-        "escape",    # System key
+        "ctrl+c",  # Copy - conflicts with app's own clipboard operations
+        "ctrl+v",  # Paste
+        "ctrl+x",  # Cut
+        "ctrl+z",  # Undo
+        "ctrl+y",  # Redo
+        "ctrl+a",  # Select all
+        "ctrl+s",  # Save
+        "ctrl+w",  # Close window
+        "ctrl+q",  # Quit
+        "ctrl+n",  # New
+        "ctrl+o",  # Open
+        "alt+f4",  # Close app
+        "alt+tab",  # Switch window
+        "win+l",  # Lock computer
+        "escape",  # System key
     }
 
     @staticmethod
@@ -576,8 +632,16 @@ class SettingsDialog:
             }
 
             # Skip modifier-only presses
-            if keysym in ("shift_l", "shift_r", "control_l", "control_r",
-                          "alt_l", "alt_r", "win_l", "win_r"):
+            if keysym in (
+                "shift_l",
+                "shift_r",
+                "control_l",
+                "control_r",
+                "alt_l",
+                "alt_r",
+                "win_l",
+                "win_r",
+            ):
                 return ""
 
             key = key_map.get(keysym, keysym)
@@ -608,7 +672,11 @@ class SettingsDialog:
                 if hotkey.lower() in SettingsDialog._BLOCKED_HOTKEYS:
                     import tkinter.messagebox as messagebox
 
-                    title = t("settings.error.invalid_hotkey") if hasattr(t, "_dict") and "settings.error.invalid_hotkey" in t._dict else "Invalid Hotkey"  # noqa: E501
+                    title = (
+                        t("settings.error.invalid_hotkey")
+                        if hasattr(t, "_dict") and "settings.error.invalid_hotkey" in t._dict
+                        else "Invalid Hotkey"
+                    )  # noqa: E501
                     msg = (
                         f"{hotkey} cannot be used as it conflicts with "
                         "system or application functions.\n\n"
@@ -663,12 +731,39 @@ class SettingsDialog:
         lang_var: tk.StringVar,
     ) -> None:
         """Collect values from the dialog, persist, and notify the app."""
+        import copy
         import tkinter.messagebox as messagebox
 
         try:
             gain_value = gain_var.get()
         except Exception:
-            messagebox.showerror(t("settings.error.invalid_gain"), t("settings.error.invalid_gain"))
+            messagebox.showerror("Invalid Gain", t("settings.error.invalid_gain"))
+            return
+
+        # Validate gain_boost range
+        if not _validate_gain(gain_value):
+            messagebox.showerror(
+                "Invalid Gain",
+                "Gain boost must be between 0.1 and 10.0.",
+            )
+            return
+
+        # Validate URLs
+        llm_url = llm_url_var.get().strip()
+        stt_api_url = stt_api_url_var.get().strip()
+
+        if llm_url and not _validate_url(llm_url):
+            messagebox.showerror(
+                "Invalid URL",
+                "LLM base URL must be a valid HTTP/HTTPS URL.",
+            )
+            return
+
+        if stt_api_url and not _validate_url(stt_api_url):
+            messagebox.showerror(
+                "Invalid URL",
+                "STT API URL must be a valid HTTP/HTTPS URL.",
+            )
             return
 
         # Validate hotkey
@@ -682,31 +777,58 @@ class SettingsDialog:
             messagebox.showwarning("Invalid Hotkey", msg)
             return
 
-        # Apply changes to config
-        self._config.hotkey.trigger = hotkey_var.get().strip()
-        self._config.hotkey.mode = hotkey_mode_var.get().strip()
-        self._config.llm.base_url = llm_url_var.get().strip()
-        self._config.llm.api_key = llm_key_var.get().strip()
-        self._config.llm.model = llm_model_var.get().strip()
-        self._config.stt.backend = stt_backend_var.get().strip()
-        self._config.stt.api_base_url = stt_api_url_var.get().strip()
-        self._config.stt.api_key = stt_api_key_var.get().strip()
-        self._config.stt.api_model = stt_api_model_var.get().strip()
-        self._config.stt.model_size = stt_model_var.get().strip()
-        self._config.stt.device = stt_device_var.get().strip()
-        self._config.stt.realtime_api_key = stt_realtime_api_key_var.get().strip()
-        self._config.stt.realtime_api_model = stt_realtime_api_model_var.get().strip()
-        self._config.audio.gain_boost = gain_value
-        self._config.overlay.capsule_position_mode = capsule_pos_var.get().strip()
-        self._config.language = lang_var.get().strip()
+        # Create a copy of the config to test save first
+        # This prevents in-memory config corruption if save fails
+        config_copy = copy.deepcopy(self._config)
+
+        # Apply changes to the copy
+        config_copy.hotkey.trigger = hotkey_var.get().strip()
+        config_copy.hotkey.mode = hotkey_mode_var.get().strip()
+        config_copy.llm.base_url = llm_url_var.get().strip()
+        config_copy.llm.api_key = llm_key_var.get().strip()
+        config_copy.llm.model = llm_model_var.get().strip()
+        config_copy.stt.backend = stt_backend_var.get().strip()
+        config_copy.stt.api_base_url = stt_api_url_var.get().strip()
+        config_copy.stt.api_key = stt_api_key_var.get().strip()
+        config_copy.stt.api_model = stt_api_model_var.get().strip()
+        config_copy.stt.model_size = stt_model_var.get().strip()
+        config_copy.stt.device = stt_device_var.get().strip()
+        config_copy.stt.realtime_api_key = stt_realtime_api_key_var.get().strip()
+        config_copy.stt.realtime_api_model = stt_realtime_api_model_var.get().strip()
+        config_copy.audio.gain_boost = gain_value
+        config_copy.overlay.capsule_position_mode = capsule_pos_var.get().strip()
+        config_copy.language = lang_var.get().strip()
 
         try:
-            save_config(self._config)
+            save_config(config_copy)
             logger.info("Configuration saved")
-        except Exception:
+        except Exception as e:
             logger.exception("Failed to save configuration")
-            messagebox.showerror("Error", t("settings.error.save_failed"))
+            # Provide more detailed error message
+            msg = t("settings.error.save_failed")
+            messagebox.showerror(
+                "Save Failed", f"{msg}\n\nA backup (.toml.bak) has been preserved.\nError: {e}"
+            )
             return
+
+        # Only update in-memory config after successful save
+        # Update individual fields to preserve object references
+        self._config.hotkey.trigger = config_copy.hotkey.trigger
+        self._config.hotkey.mode = config_copy.hotkey.mode
+        self._config.llm.base_url = config_copy.llm.base_url
+        self._config.llm.api_key = config_copy.llm.api_key
+        self._config.llm.model = config_copy.llm.model
+        self._config.stt.backend = config_copy.stt.backend
+        self._config.stt.api_base_url = config_copy.stt.api_base_url
+        self._config.stt.api_key = config_copy.stt.api_key
+        self._config.stt.api_model = config_copy.stt.api_model
+        self._config.stt.model_size = config_copy.stt.model_size
+        self._config.stt.device = config_copy.stt.device
+        self._config.stt.realtime_api_key = config_copy.stt.realtime_api_key
+        self._config.stt.realtime_api_model = config_copy.stt.realtime_api_model
+        self._config.audio.gain_boost = config_copy.audio.gain_boost
+        self._config.overlay.capsule_position_mode = config_copy.overlay.capsule_position_mode
+        self._config.language = config_copy.language
 
         root.destroy()
 
@@ -735,11 +857,13 @@ class TrayApp:
         on_settings_changed: Callable[[AppConfig], None],
         on_quit: Callable[[], None],
         on_personas_changed: Callable[[], None] | None = None,
+        is_recording: Callable[[], bool] | None = None,
     ) -> None:
         self._config = config
         self._on_settings_changed = on_settings_changed
         self._on_quit = on_quit
         self._on_personas_changed_cb = on_personas_changed
+        self._is_recording = is_recording
         self._status: str = "Ready"
         self._icon: pystray.Icon | None = None
 
@@ -848,6 +972,31 @@ class TrayApp:
 
     def _show_settings_dialog(self) -> None:
         """Create and show the settings dialog (runs on its own thread)."""
+        # Prevent opening settings during recording to avoid config conflicts
+        if self._is_recording and self._is_recording():
+            import tkinter.messagebox as messagebox
+
+            # Create a temporary hidden root for the message box
+            root = tk.Tk()
+            root.withdraw()
+
+            title_key = "settings.error.recording_title"
+            msg_key = "settings.error.recording_message"
+            title = (
+                t(title_key)
+                if hasattr(t, "_dict") and title_key in t._dict
+                else "Recording in Progress"
+            )
+            message = (
+                t(msg_key)
+                if hasattr(t, "_dict") and msg_key in t._dict
+                else "Cannot open settings while recording. "
+                "Please finish or cancel the recording first."
+            )
+            messagebox.showwarning(title, message)
+            root.destroy()
+            return
+
         try:
             dialog = SettingsDialog(self._config, self._on_settings_saved)
             dialog.show()
