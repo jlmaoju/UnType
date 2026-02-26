@@ -417,7 +417,6 @@ class UnTypeApp:
                 def _start_realtime_session():
                     if not self._cancel_requested.is_set():
                         try:
-                            logger.info("Starting realtime recognition session...")
                             if isinstance(self._stt, STTRealtimeApiEngine):
                                 self._stt.start_recording_session()
                                 self._overlay.show_realtime_preview(self._caret_x, self._caret_y)
