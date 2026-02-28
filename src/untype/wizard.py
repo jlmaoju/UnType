@@ -1467,8 +1467,8 @@ class SetupWizard:
             self._page_vars["llm_verified"] = False
 
     def _page_persona_selection(self, parent: tk.Frame) -> None:
-        """Show persona selection page (Page 6) - 3x3 grid with cards."""
-        frame = tk.Frame(parent, bg="#2d2d2d", padx=40, pady=30)
+        """Show persona selection page (Page 6) - compact 3x3 grid with cards."""
+        frame = tk.Frame(parent, bg="#2d2d2d", padx=40, pady=25)
         frame.pack(fill="both", expand=True)
 
         tk.Label(
@@ -1477,15 +1477,15 @@ class SetupWizard:
             font=("Microsoft YaHei UI", 14, "bold"),
             bg="#2d2d2d",
             fg="#e0e0e0",
-        ).pack(pady=(0, 10))
+        ).pack(pady=(0, 8))
 
         tk.Label(
             frame,
-            text="点击卡片切换激活状态（录音时可见）",
-            font=("Microsoft YaHei UI", 10),
+            text="点击卡片切换激活状态",
+            font=("Microsoft YaHei UI", 9),
             bg="#2d2d2d",
             fg="#90a4ae",
-        ).pack(pady=(0, 20))
+        ).pack(pady=(0, 15))
 
         # Load available personas
         from untype.config import load_personas, get_personas_dir
@@ -1514,31 +1514,42 @@ class SetupWizard:
             self._page_vars["persona_checkboxes"] = {}
             self._page_vars["persona_ids"] = []
 
-        # Create grid container (3x3)
+        # Create grid container (3x3) - fixed size, don't expand
         grid_frame = tk.Frame(frame, bg="#2d2d2d")
-        grid_frame.pack(fill="both", expand=True)
+        grid_frame.pack()
 
-        # Track active state for visual updates
+        # Track active state and widgets for visual updates
         active_states = {}
+        card_widgets = {}  # persona_id -> {card, check, icon, name}
 
-        def toggle_persona(persona_id, card_frame, check_label):
+        def toggle_persona(persona_id):
             """Toggle persona active state."""
             current = active_states.get(persona_id, True)
             new_state = not current
             active_states[persona_id] = new_state
             self._page_vars["persona_checkboxes"][persona_id].set(new_state)
 
-            # Update visual
-            if new_state:
-                card_frame.config(bg="#1a3a5a", relief="solid", borderwidth=2)
-                check_label.config(text="✓", fg="#4CAF50")
-            else:
-                card_frame.config(bg="#333333", relief="solid", borderwidth=1)
-                check_label.config(text="", fg="#666666")
+            # Update all widget backgrounds
+            widgets = card_widgets.get(persona_id, {})
+            new_bg = "#1a3a5a" if new_state else "#333333"
+            new_border = 2 if new_state else 1
 
-        # Add persona cards (max 9 visible, show ellipsis for more)
-        max_visible = 9
-        visible_personas = personas_list[:max_visible]
+            if "card" in widgets:
+                widgets["card"].config(bg=new_bg, relief="solid", borderwidth=new_border)
+            if "check" in widgets:
+                widgets["check"].config(
+                    text="✓" if new_state else "",
+                    fg="#4CAF50" if new_state else "#666666",
+                    bg=new_bg,
+                )
+            if "icon" in widgets:
+                widgets["icon"].config(bg=new_bg)
+            if "name" in widgets:
+                widgets["name"].config(bg=new_bg)
+
+        # Add persona cards (max 8, 9th slot is for info)
+        max_personas = 8
+        visible_personas = personas_list[:max_personas]
 
         for i, persona in enumerate(visible_personas):
             checkbox_var = self._create_boolean_var(value=persona["active"])
@@ -1558,99 +1569,103 @@ class SetupWizard:
                 bg=card_bg,
                 relief="solid",
                 borderwidth=card_border,
-                padx=15,
-                pady=12,
+                width=110,
+                height=85,
             )
-            card_frame.grid(row=row, column=col, padx=8, pady=8, sticky="nsew")
+            card_frame.grid(row=row, column=col, padx=6, pady=6)
+            card_frame.pack_propagate(False)
 
             # Check indicator
             check_label = tk.Label(
                 card_frame,
                 text="✓" if is_active else "",
-                font=("Microsoft YaHei UI", 12, "bold"),
+                font=("Microsoft YaHei UI", 11, "bold"),
                 bg=card_bg,
                 fg="#4CAF50" if is_active else "#666666",
             )
-            check_label.place(relx=1.0, rely=0.0, anchor="ne", x=-5, y=5)
+            check_label.place(relx=1.0, rely=0.0, anchor="ne", x=-4, y=4)
 
             # Icon
-            tk.Label(
+            icon_label = tk.Label(
                 card_frame,
                 text=persona["icon"],
-                font=("Microsoft YaHei UI", 24),
+                font=("Microsoft YaHei UI", 20),
                 bg=card_bg,
-            ).pack(pady=(8, 4))
+            )
+            icon_label.pack(pady=(10, 2))
 
             # Name
-            tk.Label(
+            name_label = tk.Label(
                 card_frame,
                 text=persona["name"],
-                font=("Microsoft YaHei UI", 10),
+                font=("Microsoft YaHei UI", 9),
                 bg=card_bg,
                 fg="#e0e0e0",
-            ).pack()
+            )
+            name_label.pack()
+
+            # Store widgets for updating
+            card_widgets[persona["id"]] = {
+                "card": card_frame,
+                "check": check_label,
+                "icon": icon_label,
+                "name": name_label,
+            }
 
             # Click handler
-            def make_click(pid=persona["id"], cf=card_frame, cl=check_label):
-                return lambda e: toggle_persona(pid, cf, cl)
+            def make_click(pid=persona["id"]):
+                return lambda e: toggle_persona(pid)
 
-            for widget in card_frame.winfo_children():
+            for widget in [card_frame, check_label, icon_label, name_label]:
                 widget.bind("<Button-1>", make_click())
-            card_frame.bind("<Button-1>", make_click())
 
-        # Configure grid weights
-        for r in range(3):
-            grid_frame.grid_rowconfigure(r, weight=1)
-        for c in range(3):
-            grid_frame.grid_columnconfigure(c, weight=1)
+        # 9th position: info card about customization
+        info_card = tk.Frame(
+            grid_frame,
+            bg="#2a2a2a",
+            relief="solid",
+            borderwidth=1,
+            width=110,
+            height=85,
+        )
+        info_card.grid(row=2, column=2, padx=6, pady=6)
+        info_card.pack_propagate(False)
 
-        # Show ellipsis if there are more personas
-        if len(personas_list) > max_visible:
-            ellipsis_frame = tk.Frame(
-                grid_frame,
-                bg="#2d2d2d",
-                padx=15,
-                pady=12,
-            )
-            ellipsis_frame.grid(row=2, column=2, padx=8, pady=8, sticky="nsew")
+        tk.Label(
+            info_card,
+            text="➕",
+            font=("Microsoft YaHei UI", 16),
+            bg="#2a2a2a",
+            fg="#90a4ae",
+        ).pack(pady=(12, 4))
 
-            tk.Label(
-                ellipsis_frame,
-                text="⋮",
-                font=("Microsoft YaHei UI", 20),
-                bg="#2d2d2d",
-                fg="#90a4ae",
-            ).pack()
+        tk.Label(
+            info_card,
+            text="更多",
+            font=("Microsoft YaHei UI", 8),
+            bg="#2a2a2a",
+            fg="#b0bec5",
+        ).pack()
 
-            remaining = len(personas_list) - max_visible
-            tk.Label(
-                ellipsis_frame,
-                text=f"+{remaining} 更多" if remaining > 0 else "更多",
-                font=("Microsoft YaHei UI", 8),
-                bg="#2d2d2d",
-                fg="#90a4ae",
-            ).pack()
+        tk.Label(
+            info_card,
+            text="在设置中",
+            font=("Microsoft YaHei UI", 7),
+            bg="#2a2a2a",
+            fg="#78909c",
+        ).pack()
 
         # Help text at bottom
-        help_frame = tk.Frame(frame, bg="#1e1e1e", padx=15, pady=12)
-        help_frame.pack(fill="x", pady=(15, 0))
+        help_frame = tk.Frame(frame, bg="#1e1e1e", padx=15, pady=10)
+        help_frame.pack(fill="x", pady=(12, 0))
 
         tk.Label(
             help_frame,
-            text="💡 提示",
-            font=("Microsoft YaHei UI", 10, "bold"),
-            bg="#1e1e1e",
-            fg="#e0e0e0",
-        ).pack(anchor="w")
-
-        tk.Label(
-            help_frame,
-            text="• 只有激活的人格面具才会在录音时显示\n• 之后可以在设置中添加自定义人格面具",
+            text="💡 只有激活的人格才会在录音时显示",
             font=("Microsoft YaHei UI", 9),
             bg="#1e1e1e",
             fg="#90a4ae",
-            justify="left",
-        ).pack(anchor="w", pady=(5, 0))
+        ).pack(anchor="w")
 
     # ------------------------------------------------------------------
     # Page registration
