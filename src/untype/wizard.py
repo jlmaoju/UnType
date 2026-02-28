@@ -258,155 +258,93 @@ class SetupWizard:
 
     def _page_welcome(self, parent: tk.Frame) -> None:
         """Show welcome page (Page 0)."""
-        frame = tk.Frame(parent, bg="#f8f9fa", padx=40, pady=40)
+        frame = tk.Frame(parent, bg="white", padx=30, pady=20)
         frame.pack(fill="both", expand=True)
 
         # Title
         tk.Label(
             frame,
             text="🎯 欢迎使用 UnType (忘言)",
-            font=("Microsoft YaHei UI", 18, "bold"),
-            bg="#f8f9fa",
+            font=("Microsoft YaHei UI", 16, "bold"),
+            bg="white",
             fg="#333333",
-        ).pack(pady=(0, 8))
+        ).pack(pady=(0, 5))
 
         tk.Label(
             frame,
-            text="AI 语音输入 + 文本润色，两种模式，随心切换",
-            font=("Microsoft YaHei UI", 11),
-            bg="#f8f9fa",
-            fg="#666666",
-        ).pack(pady=(0, 30))
+            text="AI 语音输入 + 文本润色，两种模式",
+            font=("Microsoft YaHei UI", 10),
+            bg="white",
+            fg="#888",
+        ).pack(pady=(0, 15))
 
-        # Two-column layout for modes
-        modes_frame = tk.Frame(frame, bg="#f8f9fa")
-        modes_frame.pack(fill="both", expand=True, pady=20)
+        # Two-column layout for modes - more compact
+        modes_frame = tk.Frame(frame, bg="white")
+        modes_frame.pack(fill="x")
 
         # Left card - Speak to Insert
-        left_card = tk.Frame(modes_frame, bg="white", relief="solid", borderwidth=1, padx=25, pady=20)
-        left_card.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        left_card = tk.Frame(modes_frame, bg="#f0f7ff", relief="solid", borderwidth=1)
+        left_card.pack(side="left", fill="both", expand=True, padx=(0, 8), ipadx=15, ipady=12)
 
-        # Mode icon and title
         tk.Label(
             left_card,
             text="🎤 说话即输入",
-            font=("Microsoft YaHei UI", 14, "bold"),
-            bg="white",
-            fg="#2196F3",
-        ).pack(pady=(0, 12))
+            font=("Microsoft YaHei UI", 11, "bold"),
+            bg="#f0f7ff",
+            fg="#1976D2",
+        ).pack()
 
-        # Flow description
-        flow_frame = tk.Frame(left_card, bg="white")
-        flow_frame.pack(pady=(0, 15))
-
-        flow_steps = [
-            ("1. 按下 F6", "#555"),
-            ("↓", "#999"),
-            ("2. 说话", "#555"),
-            ("↓", "#999"),
-            ("3. 松开 → 润色后的文本出现在光标处", "#2196F3"),
-        ]
-
-        for step, color in flow_steps:
-            tk.Label(
-                flow_frame,
-                text=step,
-                font=("Microsoft YaHei UI", 10),
-                bg="white",
-                fg=color,
-            ).pack(anchor="center", pady=2)
-
-        # Divider
-        tk.Frame(left_card, bg="#e0e0e0", height=1).pack(fill="x", pady=12)
-
-        # Use cases
         tk.Label(
             left_card,
-            text="💬 适用场景",
-            font=("Microsoft YaHei UI", 10, "bold"),
-            bg="white",
+            text="按F6说话 → AI润色 → 光标处出文",
+            font=("Microsoft YaHei UI", 9),
+            bg="#f0f7ff",
             fg="#555",
-        ).pack(anchor="w", pady=(0, 8))
-
-        use_cases = ["• 快速写作 / 记笔记", "• 回复消息", "• 撰写邮件"]
-        for case in use_cases:
-            tk.Label(
-                left_card,
-                text=case,
-                font=("Microsoft YaHei UI", 9),
-                bg="white",
-                fg="#666",
-            ).pack(anchor="w", pady=3)
+            pady=5,
+        ).pack()
 
         # Right card - Select to Polish
-        right_card = tk.Frame(modes_frame, bg="white", relief="solid", borderwidth=1, padx=25, pady=20)
-        right_card.pack(side="right", fill="both", expand=True, padx=(10, 0))
+        right_card = tk.Frame(modes_frame, bg="#fff8f0", relief="solid", borderwidth=1)
+        right_card.pack(side="right", fill="both", expand=True, padx=(8, 0), ipadx=15, ipady=12)
 
-        # Mode icon and title
         tk.Label(
             right_card,
             text="✏️ 选中即润色",
-            font=("Microsoft YaHei UI", 14, "bold"),
-            bg="white",
-            fg="#FF9800",
-        ).pack(pady=(0, 12))
+            font=("Microsoft YaHei UI", 11, "bold"),
+            bg="#fff8f0",
+            fg="#F57C00",
+        ).pack()
 
-        # Flow description
-        flow_frame2 = tk.Frame(right_card, bg="white")
-        flow_frame2.pack(pady=(0, 15))
-
-        flow_steps2 = [
-            ("1. 选中已有文字", "#555"),
-            ("↓", "#999"),
-            ("2. 说出修改要求", "#555"),
-            ("↓", "#999"),
-            ("3. AI 按你的要求改写", "#FF9800"),
-        ]
-
-        for step, color in flow_steps2:
-            tk.Label(
-                flow_frame2,
-                text=step,
-                font=("Microsoft YaHei UI", 10),
-                bg="white",
-                fg=color,
-            ).pack(anchor="center", pady=2)
-
-        # Divider
-        tk.Frame(right_card, bg="#e0e0e0", height=1).pack(fill="x", pady=12)
-
-        # Example commands
         tk.Label(
             right_card,
-            text="💡 说话示例",
-            font=("Microsoft YaHei UI", 10, "bold"),
-            bg="white",
+            text='"改正式/翻译/缩短" → AI改写',
+            font=("Microsoft YaHei UI", 9),
+            bg="#fff8f0",
             fg="#555",
-        ).pack(anchor="w", pady=(0, 8))
+            pady=5,
+        ).pack()
 
-        examples = [
-            '"把这段改得更正式"',
-            '"翻译成英文"',
-            '"缩短一些"',
-            '"用更随意的语气"',
-        ]
-        for example in examples:
+        # Quick examples in one line
+        examples_frame = tk.Frame(frame, bg="white")
+        examples_frame.pack(pady=(12, 0))
+
+        tk.Label(
+            examples_frame,
+            text="💡 润色示例：",
+            font=("Microsoft YaHei UI", 9),
+            bg="white",
+            fg="#888",
+        ).pack(side="left")
+
+        examples = ['"更正式"', '"翻译"', '"缩短"', '"扩写"']
+        for ex in examples:
             tk.Label(
-                right_card,
-                text=example,
+                examples_frame,
+                text=ex,
                 font=("Microsoft YaHei UI", 9),
                 bg="white",
                 fg="#666",
-            ).pack(anchor="w", pady=3)
-
-        # Bottom hint
-        tk.Label(
-            frame,
-            text='👇 点击"下一步"开始配置你的 API',
-            font=("Microsoft YaHei UI", 10),
-            bg="#f8f9fa",
-            fg="#999",
-        ).pack(pady=(20, 0))
+            ).pack(side="left", padx=5)
 
     def _page_stt_selection(self, parent: tk.Frame) -> None:
         """Show STT mode selection page (Page 1)."""
