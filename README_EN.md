@@ -144,10 +144,13 @@ This project is licensed under the [GNU General Public License v3.0](LICENSE).
 
 ### v0.3.0 (2025-02-28)
 - **Add first-run setup wizard** — Guided configuration for new users, with STT/LLM API setup and connection testing
-- **Add persona activation feature** — Enable/disable personas in the manager; only active personas appear during recording
+- **Add persona activation feature** — Select personas to activate during wizard; enable/disable in persona manager
+- **Add grid-based persona selection** — 3×3 card layout in wizard, click to toggle activation
+- **Add rerun wizard button** — "Rerun Setup Wizard" button in settings dialog for reconfiguration
 - **Add LLM connection verification** — Test API connection directly in the wizard and settings
-- **Improve onboarding experience** — Real-time configuration preview, API validation, persona selection during setup
+- **Improve onboarding experience** — Real-time configuration preview, API validation, streaming API renamed
 - **Update translations** — Add persona activation-related strings in Chinese and English
+- **Polish wizard UI** — Dark theme, Zhuangzi quote, improved card descriptions
 
 ### v0.2.1 (2025-02-26)
 - Add "Default" persona (regular polish style)

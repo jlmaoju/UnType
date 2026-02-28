@@ -274,11 +274,29 @@ class SetupWizard:
             font=("Microsoft YaHei UI", 18, "bold"),
             bg="#2d2d2d",
             fg="#e0e0e0",
-        ).pack(pady=(0, 30))
+        ).pack(pady=(0, 5))
+
+        # Subtitle - Zhuangzi reference
+        tk.Label(
+            main_container,
+            text="「得意而忘言」— 语出《庄子·外物》",
+            font=("Microsoft YaHei UI", 9),
+            bg="#2d2d2d",
+            fg="#90a4ae",
+        ).pack(pady=(0, 8))
+
+        # Two features description
+        tk.Label(
+            main_container,
+            text="两大核心功能",
+            font=("Microsoft YaHei UI", 11, "bold"),
+            bg="#2d2d2d",
+            fg="#b0bec5",
+        ).pack(pady=(0, 15))
 
         # Two-column layout for modes
         modes_frame = tk.Frame(main_container, bg="#2d2d2d")
-        modes_frame.pack(fill="x", pady=(0, 25))
+        modes_frame.pack(fill="x", pady=(0, 20))
 
         # Left card - Speak to Insert - dark theme with blue accent
         left_card = tk.Frame(modes_frame, bg="#1a3a5a", relief="solid", borderwidth=1)
@@ -406,9 +424,9 @@ class SetupWizard:
         options = [
             {
                 "value": "realtime_api",
-                "title": "🌐 阿里云实时 API",
+                "title": "🌐 流式识别 API",
                 "subtitle": "低延迟、实时预览、需联网",
-                "badge": "推荐",
+                "badge": "体验最佳",
             },
             {
                 "value": "api",
@@ -915,17 +933,17 @@ class SetupWizard:
             fg="#90a4ae",
         ).pack(pady=(0, 25))
 
-        # How to use
-        howto_frame = tk.Frame(frame, bg="#2d2d2d", padx=20, pady=15)
-        howto_frame.pack(fill="x", pady=(0, 20))
+        # How to use - centered
+        howto_frame = tk.Frame(frame, bg="#2d2d2d")
+        howto_frame.pack(pady=(0, 20))
 
         tk.Label(
             howto_frame,
-            text="如何使用：",
+            text="如何使用",
             font=("Microsoft YaHei UI", 11, "bold"),
             bg="#2d2d2d",
             fg="#e0e0e0",
-        ).pack(anchor="w")
+        ).pack(pady=(0, 8))
 
         steps = [
             "1. 将光标放在想要输入的位置",
@@ -941,24 +959,25 @@ class SetupWizard:
                 font=("Microsoft YaHei UI", 9),
                 bg="#2d2d2d",
                 fg="#b0bec5",
-            ).pack(anchor="w", pady=3)
+            ).pack(pady=2)
 
-        # Tips
+        # Tips - centered
         tips_frame = tk.Frame(frame, bg="#2d2d2d")
-        tips_frame.pack(fill="x", pady=(0, 20))
+        tips_frame.pack(pady=(0, 20))
 
         tk.Label(
             tips_frame,
-            text="💡 小技巧：",
+            text="💡 小技巧",
             font=("Microsoft YaHei UI", 10, "bold"),
             bg="#2d2d2d",
             fg="#b0bec5",
-        ).pack(anchor="w")
+        ).pack(pady=(0, 6))
 
         tips = [
             "说话时可以看到实时预览",
             "支持选择文本后说话进行润色",
             "可在设置中自定义热键",
+            "更多请探索设置页面",
         ]
 
         for tip in tips:
@@ -968,7 +987,7 @@ class SetupWizard:
                 font=("Microsoft YaHei UI", 9),
                 bg="#2d2d2d",
                 fg="#888888",
-            ).pack(anchor="w", pady=2)
+            ).pack(pady=1)
 
     # ------------------------------------------------------------------
     # Validators
@@ -1606,7 +1625,7 @@ class SetupWizard:
                 font=("Microsoft YaHei UI", 18),
                 bg=card_bg,
             )
-            icon_label.pack(pady=(8, 1))
+            icon_label.pack(pady=(6, 0))
 
             # Name
             name_label = tk.Label(
@@ -1616,7 +1635,7 @@ class SetupWizard:
                 bg=card_bg,
                 fg="#e0e0e0",
             )
-            name_label.pack()
+            name_label.pack(pady=(0, 2))
 
             # Description
             desc_text = persona_descriptions.get(persona["id"], "")
@@ -1627,7 +1646,7 @@ class SetupWizard:
                 bg=card_bg,
                 fg="#b0bec5",
             )
-            desc_label.pack(pady=(2, 0))
+            desc_label.pack(pady=(0, 6))
 
             # Store widgets for updating
             card_widgets[persona["id"]] = {
