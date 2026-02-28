@@ -1468,7 +1468,7 @@ class SetupWizard:
 
     def _page_persona_selection(self, parent: tk.Frame) -> None:
         """Show persona selection page (Page 6) - compact 3x3 grid with cards."""
-        frame = tk.Frame(parent, bg="#2d2d2d", padx=40, pady=25)
+        frame = tk.Frame(parent, bg="#2d2d2d", padx=40, pady=20)
         frame.pack(fill="both", expand=True)
 
         tk.Label(
@@ -1477,15 +1477,15 @@ class SetupWizard:
             font=("Microsoft YaHei UI", 14, "bold"),
             bg="#2d2d2d",
             fg="#e0e0e0",
-        ).pack(pady=(0, 8))
+        ).pack(pady=(0, 5))
 
         tk.Label(
             frame,
-            text="点击卡片切换激活状态",
+            text="人格面具是预设的语气风格，让 AI 以不同方式润色你的语音",
             font=("Microsoft YaHei UI", 9),
             bg="#2d2d2d",
             fg="#90a4ae",
-        ).pack(pady=(0, 15))
+        ).pack(pady=(0, 12))
 
         # Load available personas
         from untype.config import load_personas, get_personas_dir
@@ -1509,6 +1509,18 @@ class SetupWizard:
                 except Exception:
                     continue
 
+        # Persona descriptions mapping
+        persona_descriptions = {
+            "default": "自然润色",
+            "boss": "正式得体",
+            "colleague": "友好专业",
+            "bullets": "整理分点",
+            "english_translator": "翻译英文",
+            "simplify": "简化表达",
+            "decline": "礼貌推辞",
+            "poetic": "华丽修辞",
+        }
+
         # Store persona checkbox variables
         if "persona_checkboxes" not in self._page_vars:
             self._page_vars["persona_checkboxes"] = {}
@@ -1520,7 +1532,7 @@ class SetupWizard:
 
         # Track active state and widgets for visual updates
         active_states = {}
-        card_widgets = {}  # persona_id -> {card, check, icon, name}
+        card_widgets = {}  # persona_id -> {card, check, icon, name, desc}
 
         def toggle_persona(persona_id):
             """Toggle persona active state."""
@@ -1546,6 +1558,8 @@ class SetupWizard:
                 widgets["icon"].config(bg=new_bg)
             if "name" in widgets:
                 widgets["name"].config(bg=new_bg)
+            if "desc" in widgets:
+                widgets["desc"].config(bg=new_bg)
 
         # Add persona cards (max 8, 9th slot is for info)
         max_personas = 8
@@ -1569,30 +1583,30 @@ class SetupWizard:
                 bg=card_bg,
                 relief="solid",
                 borderwidth=card_border,
-                width=110,
-                height=85,
+                width=115,
+                height=90,
             )
-            card_frame.grid(row=row, column=col, padx=6, pady=6)
+            card_frame.grid(row=row, column=col, padx=5, pady=5)
             card_frame.pack_propagate(False)
 
             # Check indicator
             check_label = tk.Label(
                 card_frame,
                 text="✓" if is_active else "",
-                font=("Microsoft YaHei UI", 11, "bold"),
+                font=("Microsoft YaHei UI", 10, "bold"),
                 bg=card_bg,
                 fg="#4CAF50" if is_active else "#666666",
             )
-            check_label.place(relx=1.0, rely=0.0, anchor="ne", x=-4, y=4)
+            check_label.place(relx=1.0, rely=0.0, anchor="ne", x=-3, y=3)
 
             # Icon
             icon_label = tk.Label(
                 card_frame,
                 text=persona["icon"],
-                font=("Microsoft YaHei UI", 20),
+                font=("Microsoft YaHei UI", 18),
                 bg=card_bg,
             )
-            icon_label.pack(pady=(10, 2))
+            icon_label.pack(pady=(8, 1))
 
             # Name
             name_label = tk.Label(
@@ -1604,19 +1618,31 @@ class SetupWizard:
             )
             name_label.pack()
 
+            # Description
+            desc_text = persona_descriptions.get(persona["id"], "")
+            desc_label = tk.Label(
+                card_frame,
+                text=desc_text,
+                font=("Microsoft YaHei UI", 7),
+                bg=card_bg,
+                fg="#b0bec5",
+            )
+            desc_label.pack(pady=(2, 0))
+
             # Store widgets for updating
             card_widgets[persona["id"]] = {
                 "card": card_frame,
                 "check": check_label,
                 "icon": icon_label,
                 "name": name_label,
+                "desc": desc_label,
             }
 
             # Click handler
             def make_click(pid=persona["id"]):
                 return lambda e: toggle_persona(pid)
 
-            for widget in [card_frame, check_label, icon_label, name_label]:
+            for widget in [card_frame, check_label, icon_label, name_label, desc_label]:
                 widget.bind("<Button-1>", make_click())
 
         # 9th position: info card about customization
@@ -1625,10 +1651,10 @@ class SetupWizard:
             bg="#2a2a2a",
             relief="solid",
             borderwidth=1,
-            width=110,
-            height=85,
+            width=115,
+            height=90,
         )
-        info_card.grid(row=2, column=2, padx=6, pady=6)
+        info_card.grid(row=2, column=2, padx=5, pady=5)
         info_card.pack_propagate(False)
 
         tk.Label(
