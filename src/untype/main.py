@@ -13,6 +13,7 @@ import numpy as np
 import pyperclip
 
 from untype.audio import AudioRecorder, normalize_audio
+from untype.build_info import HAS_LOCAL_STT
 from untype.clipboard import grab_selected_text, inject_text, release_all_modifiers
 from untype.config import AppConfig, Persona, load_config, load_personas, save_config
 from untype.hotkey import HotkeyListener
@@ -1798,6 +1799,14 @@ class UnTypeApp:
     def _init_stt(self) -> STTEngine | STTApiEngine | STTRealtimeApiEngine:
         """Create an STT engine from the current config."""
         cfg = self._config.stt
+
+        # Fallback to API if local STT is selected but not available
+        if cfg.backend == "local" and not HAS_LOCAL_STT:
+            logger.warning(
+                "Local STT backend selected but not available in this build. "
+                "Falling back to API backend."
+            )
+            cfg.backend = "api"
 
         if cfg.backend == "api":
             logger.info("Using API STT backend (%s)", cfg.api_model)

@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 import pystray
 from PIL import Image, ImageDraw
 
+from untype.build_info import HAS_LOCAL_STT
 from untype.config import AppConfig, save_config
 from untype.i18n import get_locale_display_name, list_available_locales, t
 
@@ -185,15 +186,32 @@ class SettingsDialog:
 
         # -- STT -----------------------------------------------------------
         row = self._heading(frame, t("settings.heading.stt"), row)
-        stt_backend_options = ["api", "local", "realtime_api"]
-        stt_backend_labels = [
-            t("settings.backend.api"),
-            t("settings.backend.local"),
-            t("settings.backend.realtime_api"),
-        ]
+
+        # Build STT backend options based on available features
+        if HAS_LOCAL_STT:
+            stt_backend_options = ["api", "local", "realtime_api"]
+            stt_backend_labels = [
+                t("settings.backend.api"),
+                t("settings.backend.local"),
+                t("settings.backend.realtime_api"),
+            ]
+        else:
+            # Online version: local STT is not available
+            # If current backend is local, switch to api
+            if self._config.stt.backend == "local":
+                self._config.stt.backend = "api"
+
+            stt_backend_options = ["api", "local", "realtime_api"]
+            stt_backend_labels = [
+                t("settings.backend.api"),
+                t("settings.backend.local_disabled"),
+                t("settings.backend.realtime_api"),
+            ]
 
         # Store field label widgets for show/hide (labels and their input widgets)
         stt_field_labels: dict[str, tuple[ttk.Label, tk.Widget]] = {}
+        # Store combobox widget reference for disabling
+        stt_combobox_ref: dict[str, tk.Widget] = {}
 
         def _on_stt_backend_change(backend: str) -> None:
             """Show/hide STT fields based on backend selection."""
@@ -211,8 +229,20 @@ class SettingsDialog:
                 t("settings.stt_realtime_api_model"),
             ]
 
+            # If local STT is not available and user tries to select it
+            if backend == "local" and not HAS_LOCAL_STT:
+                import tkinter.messagebox as messagebox
+                messagebox.showinfo(
+                    t("settings.backend.local") if hasattr(t, "_dict") else "Local Model",
+                    t("tooltip.local_stt_disabled") if hasattr(t, "_dict") else "Local speech recognition requires the full version.\n\nPlease download UnType-v0.3.0-full.zip from GitHub releases."
+                )
+                # Reset to api
+                stt_backend_var.set("api")
+                # Trigger the change callback for api
+                backend = "api"
+
             # Warn when selecting local mode (model download required)
-            if backend == "local" and self._config.stt.backend != "local":
+            if backend == "local" and self._config.stt.backend != "local" and HAS_LOCAL_STT:
                 import tkinter.messagebox as messagebox
                 messagebox.showwarning(
                     "本地模型提示",
@@ -243,6 +273,14 @@ class SettingsDialog:
             labels=stt_backend_labels,
             on_change=_on_stt_backend_change,
         )
+
+        # If local STT is not available, disable the local option in the combobox
+        # This is a bit tricky with ttk.Combobox - we'll handle it in the callback
+        if not HAS_LOCAL_STT:
+            # Store reference to the combobox to disable local option selection
+            # The combobox is the last widget in this row
+            combobox = frame.grid_slaves(row=row, column=1)[0]
+            stt_combobox_ref["widget"] = combobox
         row += 1
 
         # Helper to create field and track its widgets

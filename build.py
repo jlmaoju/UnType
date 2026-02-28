@@ -283,11 +283,12 @@ def clean() -> None:
         raise BuildError(f"Failed to clean build artifacts: {e}")
 
 
-def run_pyinstaller(onefile: bool = False) -> int:
+def run_pyinstaller(onefile: bool = False, online: bool = False) -> int:
     """Run PyInstaller with the spec file.
 
     Args:
         onefile: If True, build as a single .exe file.
+        online: If True, build the online version (excludes local STT).
 
     Returns:
         The return code from PyInstaller.
@@ -298,7 +299,9 @@ def run_pyinstaller(onefile: bool = False) -> int:
     # Use uv run to ensure we're in the correct virtual environment
     cmd = ["uv", "run", "pyinstaller"]
 
-    if onefile:
+    if online:
+        cmd.append("untype-online.spec")
+    elif onefile:
         cmd.extend(["--onefile", "src/untype/main.py"])
         cmd.extend([
             "--name", "untype",
@@ -334,11 +337,13 @@ Examples:
   python build.py              # Build with PyInstaller
   python build.py --clean      # Clean build artifacts first
   python build.py --onefile    # Build as single .exe (larger, slower startup)
+  python build.py --online     # Build online version (excludes local STT)
   python build.py --check-deps # Check dependencies only
         """,
     )
     parser.add_argument("--clean", action="store_true", help="Clean build artifacts first")
     parser.add_argument("--onefile", action="store_true", help="Build as single .exe (experimental)")
+    parser.add_argument("--online", action="store_true", help="Build online version (excludes local STT)")
     parser.add_argument("--check-deps", action="store_true", help="Check dependencies and exit")
     parser.add_argument("--no-deps-check", action="store_true", help="Skip dependency checking")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
@@ -369,10 +374,12 @@ Examples:
         print(f"Building UnType{version_str} with PyInstaller")
         print(f"{'='*50}\n")
 
-        rc = run_pyinstaller(onefile=args.onefile)
+        rc = run_pyinstaller(onefile=args.onefile, online=args.online)
 
         if rc == 0:
-            if args.onefile:
+            if args.online:
+                exe_path = DIST_DIR / "untype-online" / "untype-online.exe"
+            elif args.onefile:
                 exe_path = DIST_DIR / "untype.exe"
             else:
                 exe_path = DIST_DIR / "untype" / "untype.exe"
@@ -387,7 +394,8 @@ Examples:
                     size = exe_path.stat().st_size
                     print(f"Size: {size / 1024 / 1024:.1f} MB")
                 else:
-                    total_size = sum(f.stat().st_size for f in (DIST_DIR / "untype").rglob("*") if f.is_file())
+                    folder_name = "untype-online" if args.online else "untype"
+                    total_size = sum(f.stat().st_size for f in (DIST_DIR / folder_name).rglob("*") if f.is_file())
                     print(f"Total size: {total_size / 1024 / 1024:.1f} MB")
 
             print(f"{'='*50}\n")

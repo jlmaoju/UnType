@@ -9,6 +9,7 @@ from typing import Callable
 
 import httpx
 
+from untype.build_info import HAS_LOCAL_STT
 from untype.config import AppConfig, save_config
 from untype.stt import STTEngine, STTApiEngine, STTRealtimeApiEngine
 
@@ -438,14 +439,21 @@ class SetupWizard:
                 "value": "local",
                 "title": "💾 本地模型",
                 "subtitle": "无需联网、首次需下载模型",
-                "badge": None,
+                "badge": "需完整版" if not HAS_LOCAL_STT else None,
+                "disabled": not HAS_LOCAL_STT,
             },
         ]
 
         for opt in options:
+            is_disabled = opt.get("disabled", False)
+            card_bg = "#2a2a2a" if is_disabled else "#2d2d2d"
+            border_color = "#3a3a3a" if is_disabled else "#4a4a4a"
+            text_color = "#666666" if is_disabled else "#e0e0e0"
+            subtitle_color = "#555555" if is_disabled else "#888888"
+
             card_frame = tk.Frame(
                 frame,
-                bg="#2d2d2d",
+                bg=card_bg,
                 relief="solid",
                 borderwidth=1,
                 padx=15,
@@ -459,34 +467,36 @@ class SetupWizard:
                 text="",
                 variable=self._page_vars["stt_backend"],
                 value=opt["value"],
-                bg="#2d2d2d",
-                activebackground="#2d2d2d",
+                bg=card_bg,
+                activebackground=card_bg,
                 font=("Arial", 14),
+                state="disabled" if is_disabled else "normal",
             )
             radio.pack(side="left", padx=(0, 10))
 
             # Content frame
-            content_frame = tk.Frame(card_frame, bg="#2d2d2d")
+            content_frame = tk.Frame(card_frame, bg=card_bg)
             content_frame.pack(side="left", fill="both", expand=True)
 
             # Title row
-            title_row = tk.Frame(content_frame, bg="#2d2d2d")
+            title_row = tk.Frame(content_frame, bg=card_bg)
             title_row.pack(fill="x")
 
             tk.Label(
                 title_row,
                 text=opt["title"],
                 font=("Microsoft YaHei UI", 11, "bold"),
-                bg="#2d2d2d",
-                fg="#e0e0e0",
+                bg=card_bg,
+                fg=text_color,
             ).pack(side="left")
 
             if opt["badge"]:
+                badge_bg = "#666666" if is_disabled else "#4CAF50"
                 badge = tk.Label(
                     title_row,
                     text=f" {opt['badge']} ",
                     font=("Microsoft YaHei UI", 8),
-                    bg="#4CAF50",
+                    bg=badge_bg,
                     fg="white",
                 )
                 badge.pack(side="left", padx=(8, 0))
@@ -496,13 +506,14 @@ class SetupWizard:
                 content_frame,
                 text=opt["subtitle"],
                 font=("Microsoft YaHei UI", 9),
-                bg="#2d2d2d",
-                fg="#888888",
+                bg=card_bg,
+                fg=subtitle_color,
             ).pack(anchor="w")
 
-            # Click to select
-            for widget in [card_frame, content_frame, title_row]:
-                widget.bind("<Button-1>", lambda e, v=opt["value"]: self._page_vars["stt_backend"].set(v))
+            # Click to select (only if not disabled)
+            if not is_disabled:
+                for widget in [card_frame, content_frame, title_row]:
+                    widget.bind("<Button-1>", lambda e, v=opt["value"]: self._page_vars["stt_backend"].set(v))
 
     def _page_stt_config_realtime(self, parent: tk.Frame) -> None:
         """Show realtime API config page (Page 2 - realtime)."""
@@ -999,6 +1010,16 @@ class SetupWizard:
         if not backend:
             messagebox.showwarning("请选择", "请选择一种语音识别方式")
             return False
+
+        # Prevent selecting local STT if not available
+        if backend == "local" and not HAS_LOCAL_STT:
+            messagebox.showinfo(
+                "本地模式不可用",
+                "本地语音识别需要完整版 UnType。\n\n"
+                "请从 GitHub 发布页面下载 UnType-v0.3.0-full.zip"
+            )
+            return False
+
         self._temp_config.stt.backend = backend
         return True
 

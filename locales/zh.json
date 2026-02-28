@@ -32,6 +32,7 @@
     "settings.backend": "后端:",
     "settings.backend.api": "在线 API",
     "settings.backend.local": "本地模型 (需下载模型)",
+    "settings.backend.local_disabled": "本地模型 (需完整版)",
     "settings.backend.realtime_api": "实时 API (阿里云)",
     "settings.stt_api_url": "STT API 地址:",
     "settings.stt_api_key": "STT API 密钥:",
@@ -54,6 +55,7 @@
     "settings.rerun_wizard": "重新运行向导",
     "settings.error.invalid_gain": "音频增益倍数必须是数字。",
     "settings.error.save_failed": "保存配置文件失败。",
+    "tooltip.local_stt_disabled": "本地语音识别需要完整版\n请从 GitHub 发布页面下载 UnType-v0.3.0-full.zip",
 
     "overlay.recording": "录音中...",
     "overlay.transcribing": "转录中...",
