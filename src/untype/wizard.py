@@ -193,8 +193,9 @@ class SetupWizard:
             2: self._validate_stt_config,
             3: self._validate_stt_verify,
             4: self._validate_llm_config,
-            5: self._validate_persona_selection,
-            6: self._validate_quick_start,
+            5: self._validate_llm_verify,
+            6: self._validate_persona_selection,
+            7: self._validate_quick_start,
         }
         validator = page_validators.get(self._current_page, lambda: True)
         return validator()
@@ -774,33 +775,6 @@ class SetupWizard:
                 show="*" if "key" in var_key else None,
             ).pack(fill="x", pady=(5, 0))
 
-        # Verification section
-        verify_frame = tk.Frame(frame, bg="white")
-        verify_frame.pack(fill="x", pady=(10, 0))
-
-        self._llm_verify_label = tk.Label(
-            verify_frame,
-            text="配置 LLM 后点击下方「验证」按钮测试连接",
-            font=("Microsoft YaHei UI", 9),
-            bg="white",
-            fg="#888888",
-        )
-        self._llm_verify_label.pack(pady=(0, 5))
-
-        verify_btn_frame = tk.Frame(verify_frame, bg="white")
-        verify_btn_frame.pack()
-
-        tk.Button(
-            verify_btn_frame,
-            text="验证 LLM 连接",
-            font=("Microsoft YaHei UI", 9),
-            bg="#2196F3",
-            fg="white",
-            relief="flat",
-            cursor="hand2",
-            command=self._verify_llm_config,
-        ).pack()
-
         # Help text
         help_frame = tk.Frame(frame, bg="#fff8e1", padx=15, pady=12)
         help_frame.pack(fill="x", pady=(10, 0))
@@ -812,6 +786,26 @@ class SetupWizard:
             bg="#fff8e1",
             fg="#666666",
         ).pack(anchor="w")
+
+    def _page_llm_verify(self, parent: tk.Frame) -> None:
+        """Show LLM verification page (Page 5)."""
+        frame = tk.Frame(parent, bg="white", padx=40, pady=40)
+        frame.pack(fill="both", expand=True)
+
+        tk.Label(
+            frame,
+            text="配置验证",
+            font=("Microsoft YaHei UI", 14, "bold"),
+            bg="white",
+            fg="#333333",
+        ).pack(pady=(0, 20))
+
+        # Verification will happen when page is shown
+        self._llm_verify_frame = tk.Frame(frame, bg="white")
+        self._llm_verify_frame.pack(fill="both", expand=True)
+
+        # Trigger verification after UI is ready
+        self._root.after(100, self._verify_llm_config)
 
     def _page_quick_start(self, parent: tk.Frame) -> None:
         """Show quick start page (Page 5)."""
@@ -959,6 +953,11 @@ class SetupWizard:
         self._temp_config.llm.api_key = api_key
         self._temp_config.llm.model = model
         return True
+
+    def _validate_llm_verify(self) -> bool:
+        """Validate LLM verification page."""
+        # Verification happens on page show, this just checks if it passed
+        return self._page_vars.get("llm_verified", False)
 
     def _validate_quick_start(self) -> bool:
         """Validate quick start page (always true)."""
@@ -1249,22 +1248,34 @@ class SetupWizard:
         ).pack(pady=5)
 
     def _verify_llm_config(self) -> None:
-        """Verify the LLM configuration by sending a test request."""
+        """Verify LLM configuration."""
+        # Clear frame and show loading
+        for widget in self._llm_verify_frame.winfo_children():
+            widget.destroy()
+
+        tk.Label(
+            self._llm_verify_frame,
+            text="正在验证配置...",
+            font=("Microsoft YaHei UI", 11),
+            bg="white",
+            fg="#2196F3",
+        ).pack(pady=30)
+
+        self._root.update()
+
         base_url = self._page_vars["llm_base_url"].get().strip()
         api_key = self._page_vars["llm_api_key"].get().strip()
         model = self._page_vars["llm_model"].get().strip()
 
-        if not base_url or not api_key or not model:
-            messagebox.showwarning("请填写完整", "请填写所有 LLM 配置信息才能验证")
-            return
+        verified = False
+        message = ""
+        can_continue = False  # Whether user can proceed despite verification failure
 
-        self._llm_verify_label.config(text="正在验证...", fg="#2196F3")
-        self._wizard_window.update()
-
-        def verify_thread():
-            try:
-                import httpx
-                # Send a simple test request
+        try:
+            if not base_url or not api_key or not model:
+                message = "✗ 配置不完整\n\n请填写 API 地址、密钥和模型名称"
+                can_continue = False
+            else:
                 with httpx.Client(timeout=10.0) as client:
                     response = client.post(
                         f"{base_url.rstrip('/')}/chat/completions",
@@ -1280,18 +1291,93 @@ class SetupWizard:
                     )
 
                 if response.status_code == 200:
-                    self._root.after(0, lambda: self._llm_verify_label.config(text="✓ 验证成功", fg="#4CAF50"))
+                    verified = True
+                    message = "✓ LLM 配置正常\n✓ API 连接验证通过"
+                    can_continue = True
                 elif response.status_code == 401:
-                    self._root.after(0, lambda: self._llm_verify_label.config(text="✗ API 密钥错误", fg="#f44336"))
+                    message = "✗ API 密钥错误\n\n请检查密钥是否正确"
+                    can_continue = False
                 elif response.status_code == 404:
-                    self._root.after(0, lambda: self._llm_verify_label.config(text="✗ 模型不存在", fg="#f44336"))
+                    message = "✗ 模型不存在\n\n请检查模型名称是否正确"
+                    can_continue = False
                 else:
-                    self._root.after(0, lambda: self._llm_verify_label.config(text=f"✗ 验证失败 ({response.status_code})", fg="#f44336"))
-            except Exception as e:
-                self._root.after(0, lambda: self._llm_verify_label.config(text=f"✗ 连接失败: {str(e)}", fg="#f44336"))
+                    try:
+                        error_detail = response.json().get("error", {}).get("message", str(response.status_code))
+                    except Exception:
+                        error_detail = str(response.status_code)
+                    message = f"✗ API 返回错误: {error_detail}\n\n可能是网络问题，您可以稍后重试，或点击「继续」稍后再验证。"
+                    can_continue = True
 
-        import threading
-        threading.Thread(target=verify_thread, daemon=True).start()
+        except httpx.TimeoutException:
+            message = "✗ 连接超时\n\n可能是网络问题，您可以稍后重试，或点击「继续」稍后再验证。"
+            can_continue = True
+        except httpx.ConnectError:
+            message = "✗ 无法连接到服务器\n\n请检查 API 地址是否正确，或点击「继续」稍后再验证。"
+            can_continue = True
+        except Exception as e:
+            message = f"✗ 验证失败：{e}\n\n可能是网络问题，您可以稍后重试，或点击「继续」稍后再验证。"
+            can_continue = True
+
+        # Update UI
+        for widget in self._llm_verify_frame.winfo_children():
+            widget.destroy()
+
+        if verified:
+            tk.Label(
+                self._llm_verify_frame,
+                text=message,
+                font=("Microsoft YaHei UI", 11),
+                bg="white",
+                fg="#4CAF50",
+                justify="left",
+            ).pack(pady=20)
+
+            tk.Label(
+                self._llm_verify_frame,
+                text="配置完成！可以继续下一步了。",
+                font=("Microsoft YaHei UI", 10),
+                bg="white",
+                fg="#666666",
+            ).pack()
+
+            self._page_vars["llm_verified"] = True
+        else:
+            tk.Label(
+                self._llm_verify_frame,
+                text=message,
+                font=("Microsoft YaHei UI", 11),
+                bg="white",
+                fg="#f44336" if not can_continue else "#FF9800",
+                justify="left",
+            ).pack(pady=20)
+
+            btn_frame = tk.Frame(self._llm_verify_frame, bg="white")
+            btn_frame.pack(pady=10)
+
+            tk.Button(
+                btn_frame,
+                text="重试",
+                font=("Microsoft YaHei UI", 10),
+                bg="#2196F3",
+                fg="white",
+                relief="flat",
+                cursor="hand2",
+                command=self._verify_llm_config,
+            ).pack(side="left", padx=5)
+
+            if can_continue:
+                tk.Button(
+                    btn_frame,
+                    text="继续",
+                    font=("Microsoft YaHei UI", 10),
+                    bg="#4CAF50",
+                    fg="white",
+                    relief="flat",
+                    cursor="hand2",
+                    command=lambda: self._page_vars.update({"llm_verified": True}) or self._on_next(),
+                ).pack(side="left", padx=5)
+
+            self._page_vars["llm_verified"] = False
 
     def _page_persona_selection(self, parent: tk.Frame) -> None:
         """Show persona selection page (Page 5)."""
@@ -1433,6 +1519,7 @@ class SetupWizard:
             self._get_page_2(),  # Dynamic based on selection
             self._page_stt_verify,
             self._page_llm_config,
+            self._page_llm_verify,
             self._page_persona_selection,
             self._page_quick_start,
         ]
