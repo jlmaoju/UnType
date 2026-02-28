@@ -174,6 +174,16 @@ class PersonaManagerDialog:
         self._polish_text.configure(yscrollcommand=polish_scroll.set)
         row += 1
 
+        # Active checkbox
+        self._active_var = tk.BooleanVar(master=root)
+        active_check = ttk.Checkbutton(
+            editor_frame,
+            text=t("persona.active"),
+            variable=self._active_var,
+        )
+        active_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        row += 1
+
         # Save button
         save_btn_frame = ttk.Frame(editor_frame)
         save_btn_frame.grid(row=row, column=0, columnspan=2, sticky="e", pady=(8, 0))
@@ -259,6 +269,7 @@ class PersonaManagerDialog:
         self._model_var.set("")
         self._temp_var.set("")
         self._maxtok_var.set("")
+        self._active_var.set(True)  # Default to active
         self._insert_text.delete("1.0", "end")
         self._polish_text.delete("1.0", "end")
         self._status_var.set("")
@@ -271,6 +282,7 @@ class PersonaManagerDialog:
         self._model_var.set(persona.model)
         self._temp_var.set(str(persona.temperature) if persona.temperature is not None else "")
         self._maxtok_var.set(str(persona.max_tokens) if persona.max_tokens is not None else "")
+        self._active_var.set(persona.active)
         self._insert_text.delete("1.0", "end")
         self._insert_text.insert("1.0", persona.prompt_insert)
         self._polish_text.delete("1.0", "end")
@@ -331,6 +343,7 @@ class PersonaManagerDialog:
             id=pid,
             name=name,
             icon=icon,
+            active=self._active_var.get(),
             prompt_polish=self._polish_text.get("1.0", "end-1c"),
             prompt_insert=self._insert_text.get("1.0", "end-1c"),
             model=self._model_var.get().strip(),

@@ -27,7 +27,7 @@ Most voice input tools give you raw transcription — full of filler words, brok
 - 🗣️ Plain Talk — Make complex ideas simple
 - 🙅 Decline — Politely turn down requests
 
-Press a digit key (1-8) during recording to switch. Your choice is remembered for next time. Right-click tray icon → **Personas** to customize.
+Press a digit key (1-9) during recording to switch. Your choice is remembered for next time. Only **active** personas are shown during recording — manage activation in **Personas** dialog.
 
 ## Core Features
 
@@ -42,6 +42,8 @@ Press a digit key (1-8) during recording to switch. Your choice is remembered fo
 - **Recording duration display** — Shows elapsed time on capsule (e.g., "1:23"), auto-stops after 5 minutes
 - **Volume visualization** — Real-time volume bar at the bottom of the capsule during recording
 - **Persona memory** — Remembers your last selected persona, auto-selects it next time
+- **Persona activation** — Enable/disable personas to control which appear during recording
+- **First-run wizard** — Guided setup for new users to configure STT and LLM APIs
 - **Ghost Menu** — Post-injection undo menu: revert to raw draft, regenerate, or reopen editor. No countdown pressure.
 - **Adjustable capsule position** — Choose fixed (draggable, position saved) or follow cursor mode
 - **Hotkey recording** — Click the input field in settings and press your desired key
@@ -139,6 +141,13 @@ uv run pytest                # Run tests
 This project is licensed under the [GNU General Public License v3.0](LICENSE).
 
 ## Changelog
+
+### v0.3.0 (2025-02-28)
+- **Add first-run setup wizard** — Guided configuration for new users, with STT/LLM API setup and connection testing
+- **Add persona activation feature** — Enable/disable personas in the manager; only active personas appear during recording
+- **Add LLM connection verification** — Test API connection directly in the wizard and settings
+- **Improve onboarding experience** — Real-time configuration preview, API validation, persona selection during setup
+- **Update translations** — Add persona activation-related strings in Chinese and English
 
 ### v0.2.1 (2025-02-26)
 - Add "Default" persona (regular polish style)

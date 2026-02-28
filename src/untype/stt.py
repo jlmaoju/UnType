@@ -171,6 +171,9 @@ class STTRealtimeApiEngine:
     Audio is sent in chunks during recording, results arrive incrementally.
     """
 
+    # Maximum time to wait for WebSocket connection to establish
+    SESSION_READY_TIMEOUT = 5.0  # seconds
+
     def __init__(
         self,
         api_key: str,
@@ -194,6 +197,8 @@ class STTRealtimeApiEngine:
         self._current_text = ""
         self._lock = threading.Lock()
         self._session_active = False
+        self._session_ready = threading.Event()  # Set when WebSocket is ready to receive audio
+        self._connection_failed = False  # Set to True if connection fails
 
         logger.info(
             "STT Realtime API engine ready (model=%s, format=%s, sr=%s)",
@@ -221,11 +226,21 @@ class STTRealtimeApiEngine:
             # Ensure session is always stopped, even if get_result() raises
             self.stop_session()
 
-    def start_session(self) -> None:
-        """Start a new realtime recognition session."""
+    def start_session(self) -> bool:
+        """Start a new realtime recognition session.
+
+        Waits for the WebSocket connection to be established before returning.
+
+        Returns:
+            True if the session was started successfully, False if connection failed.
+        """
         if self._session_active:
             logger.warning("Session already active, ignoring start_session")
-            return
+            return True
+
+        # Reset the connection state
+        self._session_ready.clear()
+        self._connection_failed = False
 
         try:
             import dashscope
@@ -238,7 +253,14 @@ class STTRealtimeApiEngine:
 
             class _Callback(RecognitionCallback):
                 def on_open(self) -> None:
-                    logger.debug("Realtime recognition WebSocket opened")
+                    logger.info("Realtime recognition WebSocket connected")
+                    # Clear any previous session data to prevent accumulation
+                    engine_ref._finalized_text = ""
+                    engine_ref._pending_sentence = ""
+                    engine_ref._current_text = ""
+                    # Signal that connection is ready
+                    engine_ref._session_ready.set()
+                    engine_ref._connection_failed = False
 
                 def on_event(self, result) -> None:
                     try:
@@ -286,6 +308,10 @@ class STTRealtimeApiEngine:
                         )
                     except Exception as exc:
                         logger.error("Realtime recognition error: %s", exc)
+                    finally:
+                        # Signal that the connection attempt failed
+                        engine_ref._connection_failed = True
+                        engine_ref._session_ready.set()
 
                 def on_close(self) -> None:
                     logger.debug("Realtime recognition WebSocket closed")
@@ -297,17 +323,47 @@ class STTRealtimeApiEngine:
                 callback=_Callback(),
             )
             self._recognition.start()
+
+            # Wait for the WebSocket connection to be established
+            if not self._session_ready.wait(timeout=self.SESSION_READY_TIMEOUT):
+                logger.error(
+                    "Realtime recognition session timed out after %.1f seconds",
+                    self.SESSION_READY_TIMEOUT,
+                )
+                # Clean up the failed recognition object
+                try:
+                    self._recognition.stop()
+                except Exception:
+                    pass
+                self._recognition = None
+                return False
+
+            # Check if the connection failed
+            if self._connection_failed:
+                logger.error("Realtime recognition session connection failed")
+                # Clean up the failed recognition object
+                try:
+                    self._recognition.stop()
+                except Exception:
+                    pass
+                self._recognition = None
+                return False
+
             self._session_active = True
-            self._finalized_text = ""
-            self._pending_sentence = ""
-            self._current_text = ""
-            logger.info("Realtime recognition session started")
+            logger.info("Realtime recognition session started successfully")
+            return True
+
         except ImportError as exc:
             logger.error("dashscope package not installed: %s", exc)
             raise RuntimeError(
                 "dashscope package is required for realtime STT. "
                 "Install with: pip install dashscope"
             ) from exc
+        except Exception as exc:
+            logger.error("Failed to start realtime recognition session: %s", exc)
+            self._connection_failed = True
+            self._session_ready.set()
+            return False
 
     def send_audio(self, audio: np.ndarray) -> None:
         """Send an audio chunk to the ongoing recognition session.
@@ -316,7 +372,8 @@ class STTRealtimeApiEngine:
             audio: Float32 numpy array at the configured sample rate.
                    Recommended chunk size: 100ms (1600 samples at 16kHz).
         """
-        if not self._session_active:
+        # Check if session is ready (either active or waiting for connection)
+        if not self._session_active and not self._session_ready.is_set():
             logger.warning("No active session, cannot send audio")
             return
 
@@ -324,13 +381,16 @@ class STTRealtimeApiEngine:
         pcm16 = (audio * 32767).clip(-32768, 32767).astype(np.int16)
         self._recognition.send_audio_frame(pcm16.tobytes())
 
-    def start_recording_session(self) -> None:
+    def start_recording_session(self) -> bool:
         """Start a realtime recognition session for recording.
 
         This starts the WebSocket connection so audio can be streamed
         during recording via on_audio_chunk().
+
+        Returns:
+            True if the session was started successfully, False otherwise.
         """
-        self.start_session()
+        return self.start_session()
 
     def on_audio_chunk(self, audio: np.ndarray) -> None:
         """Handle an audio chunk during recording (to be called from audio callback).

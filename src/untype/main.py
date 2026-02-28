@@ -50,10 +50,12 @@ class UnTypeApp:
         # -- Persona system -----------------------------------------------
         self._personas: list[Persona] = load_personas()
         if self._personas:
+            active_count = sum(1 for p in self._personas if p.active)
             logger.info(
-                "Loaded %d persona(s): %s",
+                "Loaded %d persona(s) (%d active): %s",
                 len(self._personas),
-                ", ".join(p.name for p in self._personas),
+                active_count,
+                ", ".join(p.name for p in self._personas if p.active),
             )
 
         # -- Interaction state (written in on_press, read in pipeline) --------
@@ -101,6 +103,18 @@ class UnTypeApp:
         logger.info("Initialising audio recorder...")
         self._recorder = self._init_recorder()
 
+        logger.info("Initialising system tray...")
+        self._tray = TrayApp(
+            config=self._config,
+            on_settings_changed=self._on_settings_changed,
+            on_quit=self._on_quit,
+            on_personas_changed=self._on_personas_changed,
+        )
+
+        # STT configuration self-check (after tray is ready)
+        logger.info("Checking STT configuration...")
+        self._handle_stt_config_check()
+
         logger.info("Initialising STT engine (this may take a moment)...")
         self._stt = self._init_stt()
 
@@ -114,14 +128,6 @@ class UnTypeApp:
             on_release=self._on_hotkey_release,
             mode=self._config.hotkey.mode,
             on_escape=self._on_cancel,
-        )
-
-        logger.info("Initialising system tray...")
-        self._tray = TrayApp(
-            config=self._config,
-            on_settings_changed=self._on_settings_changed,
-            on_quit=self._on_quit,
-            on_personas_changed=self._on_personas_changed,
         )
 
         logger.info("Initialising overlay...")
@@ -149,6 +155,11 @@ class UnTypeApp:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    @property
+    def _active_personas(self) -> list[Persona]:
+        """Return only active personas (shown during recording)."""
+        return [p for p in self._personas if p.active]
 
     def _start_daemon_thread(self, target, name: str) -> None:
         """Start a daemon thread with consistent naming convention.
@@ -362,20 +373,42 @@ class UnTypeApp:
                 caret.found,
             )
 
-            # Start recording FIRST so the user's speech is captured from
-            # the moment they press the hotkey, not after the clipboard probe.
+            # For realtime API, establish the WebSocket session FIRST
+            # to avoid losing audio data before the connection is ready.
+            session_ready = False
+            if self._config.stt.backend == "realtime_api":
+                if isinstance(self._stt, STTRealtimeApiEngine):
+                    logger.info("Starting realtime recognition session...")
+                    self._overlay.show(self._caret_x, self._caret_y, "正在连接服务器...")
+                    session_ready = self._stt.start_recording_session()
+                    if session_ready:
+                        logger.info("Realtime recognition session ready")
+                    else:
+                        logger.warning("Failed to establish realtime recognition session")
+                        self._overlay.update_status("连接失败，请检查网络")
+                        # Don't abort - fall through to recording anyway
+
+            # Start recording. For non-realtime backends, this happens first.
+            # For realtime, we wait for the session to be ready.
             logger.info("Starting audio recording...")
             self._recorder.start()
             self._tray.update_status("Recording...")
-            self._overlay.show(self._caret_x, self._caret_y, "Recording...")
+
+            # Update capsule status to Recording...
+            if self._config.stt.backend == "realtime_api" and session_ready:
+                # Capsule already shown, just update status
+                self._overlay.update_status("Recording...")
+            else:
+                # Show capsule with Recording status
+                self._overlay.show(self._caret_x, self._caret_y, "Recording...")
 
             # Start the timeout monitor thread
             self._start_timeout_monitor()
 
             # Show recording persona bar (if personas configured).
             self._preselected_persona = None
-            if self._personas:
-                persona_tuples = [(p.id, p.icon, p.name) for p in self._personas]
+            if self._active_personas:
+                persona_tuples = [(p.id, p.icon, p.name) for p in self._active_personas]
                 self._overlay.show_recording_personas(
                     persona_tuples,
                     self._caret_x,
@@ -387,12 +420,16 @@ class UnTypeApp:
                 # Auto-select the remembered persona (if any and exists)
                 last_id = self._config.last_selected_persona
                 if last_id:
-                    for idx, p in enumerate(self._personas):
+                    for idx, p in enumerate(self._active_personas):
                         if p.id == last_id:
                             self._preselected_persona = p
                             self._overlay.select_recording_persona(idx)
                             logger.info("Auto-selected remembered persona: %s", p.name)
                             break
+
+            # Show realtime preview (after all UI elements are positioned)
+            if self._config.stt.backend == "realtime_api" and session_ready:
+                self._overlay.show_realtime_preview(self._caret_x, self._caret_y)
 
             # Grab selected text to determine the interaction mode.
             # This happens while recording is already running.
@@ -408,26 +445,6 @@ class UnTypeApp:
 
             # Start continuous HWND monitoring.
             self._start_hwnd_watcher()
-
-            # Start realtime recognition session AFTER _recording_started is set,
-            # in a separate thread to avoid blocking. This allows the pipeline to
-            # check for cancellation before the WebSocket connection is established.
-            if self._config.stt.backend == "realtime_api":
-
-                def _start_realtime_session():
-                    if not self._cancel_requested.is_set():
-                        try:
-                            if isinstance(self._stt, STTRealtimeApiEngine):
-                                self._stt.start_recording_session()
-                                self._overlay.show_realtime_preview(self._caret_x, self._caret_y)
-                        except Exception as e:
-                            logger.warning("Failed to start realtime STT session: %s", e)
-
-                threading.Thread(
-                    target=_start_realtime_session,
-                    daemon=True,
-                    name="untype-start-realtime",
-                ).start()
 
         except Exception:
             logger.exception("Error starting recording")
@@ -615,7 +632,7 @@ class UnTypeApp:
             self._overlay.hide_recording_personas()
 
             # 5. Branch: personas configured → skip staging; otherwise → staging.
-            if self._personas:
+            if self._active_personas:
                 self._process_with_personas(text)
             else:
                 self._process_with_staging(text)
@@ -1040,8 +1057,8 @@ class UnTypeApp:
 
             # Build persona list for staging (if available).
             personas_arg = None
-            if self._personas:
-                personas_arg = [(p.id, p.icon, p.name) for p in self._personas]
+            if self._active_personas:
+                personas_arg = [(p.id, p.icon, p.name) for p in self._active_personas]
 
             # Clear last state before re-entering staging.
             self._last_raw_text = None
@@ -1249,16 +1266,17 @@ class UnTypeApp:
     def _on_digit_during_recording(self, digit: int) -> None:
         """Called from the keyboard hook thread when a digit key is pressed."""
         idx = digit - 1
-        if idx < len(self._personas):
-            if self._preselected_persona == self._personas[idx]:
+        if idx < len(self._active_personas):
+            active_persona = self._active_personas[idx]
+            if self._preselected_persona == active_persona:
                 # Toggle off: pressing the same digit again deselects.
                 self._preselected_persona = None
                 self._overlay.select_recording_persona(-1)
                 self._save_selected_persona(None)
             else:
-                self._preselected_persona = self._personas[idx]
+                self._preselected_persona = active_persona
                 self._overlay.select_recording_persona(idx)
-                self._save_selected_persona(self._personas[idx].id)
+                self._save_selected_persona(active_persona.id)
 
     def _save_selected_persona(self, persona_id: str | None) -> None:
         """Save the selected persona ID to config."""
@@ -1506,11 +1524,253 @@ class UnTypeApp:
         logger.debug("Realtime text update: %s", text)
         self._overlay.update_realtime_preview(text)
 
+    def _handle_stt_config_check(self) -> None:
+        """Handle STT configuration self-check at startup."""
+        cfg = self._config.stt
+
+        # Local model: check if exists, offer to download if not
+        if cfg.backend == "local":
+            if not self._check_local_model_exists(cfg.model_size):
+                self._handle_model_download(cfg.model_size)
+            return
+
+        # Online API: check if configured, offer to open settings if not
+        if cfg.backend == "api":
+            missing = []
+            if not cfg.api_base_url:
+                missing.append("API 地址")
+            if not cfg.api_key:
+                missing.append("API 密钥")
+            if missing:
+                self._handle_missing_api_config(missing)
+            return
+
+        # Realtime API: check if configured, offer to open settings if not
+        if cfg.backend == "realtime_api":
+            api_key = cfg.realtime_api_key or cfg.api_key
+            if not api_key:
+                self._handle_missing_api_config(["阿里云 API 密钥"])
+            return
+
+    def _handle_model_download(self, model_size: str) -> None:
+        """Handle the case when local model needs to be downloaded."""
+        import tkinter.messagebox as messagebox
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+
+        # Check network first
+        has_network = self._check_network_connectivity()
+
+        if not has_network:
+            messagebox.showerror(
+                "无法连接网络",
+                f"本地模型 '{model_size}' 不存在，需要从网络下载。\n\n"
+                "但当前无法连接到 HuggingFace，请检查网络环境后重试。"
+            )
+            root.destroy()
+            return
+
+        # Network OK, ask user to confirm download
+        result = messagebox.askyesno(
+            "下载本地模型",
+            f"本地模型 '{model_size}' 不存在，需要从网络下载（约 500MB）。\n\n"
+            "请确保网络已连接，点击「是」开始下载。\n\n"
+            "下载可能需要几分钟时间，请耐心等待。"
+        )
+        root.destroy()
+
+        if result:
+            self._download_whisper_model(model_size)
+
+    def _download_whisper_model(self, model_size: str) -> None:
+        """Download the Whisper model and show progress."""
+        import tkinter as tk
+        from tkinter import ttk
+
+        # Create progress window
+        progress_root = tk.Tk()
+        progress_root.title("下载模型")
+        progress_root.geometry("400x150")
+        progress_root.resizable(False, False)
+
+        # Center the window
+        progress_root.update_idletasks()
+        w = progress_root.winfo_width()
+        h = progress_root.winfo_height()
+        x = (progress_root.winfo_screenwidth() - w) // 2
+        y = (progress_root.winfo_screenheight() - h) // 2
+        progress_root.geometry(f"+{x}+{y}")
+
+        # Label
+        label = tk.Label(
+            progress_root,
+            text=f"正在下载 Whisper 模型 ({model_size})...\n请稍候",
+            font=("Microsoft YaHei UI", 10)
+        )
+        label.pack(pady=20)
+
+        # Progress bar
+        progress_bar = ttk.Progressbar(
+            progress_root,
+            mode="indeterminate",
+            length=300
+        )
+        progress_bar.pack(pady=10)
+        progress_bar.start()
+
+        # Status label
+        status_label = tk.Label(
+            progress_root,
+            text="正在连接 HuggingFace...",
+            font=("Microsoft YaHei UI", 9),
+            fg="#666666"
+        )
+        status_label.pack(pady=5)
+
+        # Download in a separate thread
+        def download_thread():
+            try:
+                from faster_whisper import WhisperModel
+
+                # Update status
+                progress_root.after(0, lambda: status_label.configure(text="正在下载模型文件..."))
+
+                # This will download the model
+                model = WhisperModel(model_size, device="cpu", compute_type="int8")
+
+                # Success
+                progress_root.after(0, lambda: status_label.configure(text="下载完成！"))
+                progress_root.after(0, lambda: progress_bar.stop())
+                progress_root.after(2000, lambda: progress_root.destroy())
+
+                logger.info("Whisper model %s downloaded successfully", model_size)
+
+            except Exception as e:
+                # Error
+                progress_root.after(0, lambda: progress_bar.stop())
+                progress_root.after(0, lambda: status_label.configure(text=f"下载失败: {e}"))
+                progress_root.after(0, lambda: status_label.configure(fg="#ff6666"))
+                progress_root.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "下载失败",
+                        f"模型下载失败：{e}\n\n请检查网络连接后重试。"
+                    )
+                )
+                progress_root.after(0, lambda: progress_root.destroy())
+                logger.exception("Failed to download Whisper model")
+
+        import threading
+        thread = threading.Thread(target=download_thread, daemon=True)
+        thread.start()
+
+        progress_root.mainloop()
+
+    def _handle_missing_api_config(self, missing_items: list[str]) -> None:
+        """Handle the case when API configuration is missing."""
+        import tkinter.messagebox as messagebox
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+
+        missing_text = "、".join(missing_items)
+        result = messagebox.askyesno(
+            "配置未完成",
+            f"当前模式需要配置 {missing_text}。\n\n点击「是」打开设置进行配置。"
+        )
+        root.destroy()
+
+        if result:
+            # Open settings dialog
+            self._tray.show_settings()
+
+    def _check_local_model_exists(self, model_size: str) -> bool:
+        """Check if the local Whisper model already exists."""
+        try:
+            from faster_whisper import WhisperModel
+            # Try to load the model without downloading
+            # This will raise an error if the model doesn't exist locally
+            import os
+            # Check common cache locations
+            cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+            if not os.path.exists(cache_dir):
+                return False
+
+            # Look for model folder in cache
+            model_name = f"Systran/faster-whisper-{model_size}"
+            for item in os.listdir(cache_dir):
+                if model_name.replace("-", "_").replace("/", "--") in item or model_name in item:
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _check_network_connectivity(self, timeout: float = 3.0) -> bool:
+        """Check if network connectivity to HuggingFace is available."""
+        try:
+            import urllib.request
+            import socket
+            socket.setdefaulttimeout(timeout)
+            urllib.request.urlopen("https://huggingface.co", timeout=timeout)
+            return True
+        except Exception:
+            return False
+
+    def _validate_api_endpoint(self, base_url: str, api_key: str) -> bool:
+        """Validate if the API endpoint is accessible with the given key.
+
+        This is a simple check - we just verify the endpoint is reachable.
+        """
+        try:
+            import httpx
+            import urllib.parse
+
+            # Parse and validate URL
+            parsed = urllib.parse.urlparse(base_url)
+            if not parsed.scheme or not parsed.netloc:
+                return False
+
+            # Try a simple health check or OPTIONS request
+            with httpx.Client(timeout=5.0) as client:
+                response = client.options(
+                    base_url,
+                    headers={"Authorization": f"Bearer {api_key}"}
+                )
+                # Any response (including 401/403) means the server is reachable
+                return True
+        except Exception as e:
+            logger.debug("API endpoint validation failed: %s", e)
+            return False
+
+    def _validate_dashscope_key(self, api_key: str) -> bool:
+        """Validate if the DashScope API key is format-valid and service is reachable."""
+        try:
+            import httpx
+
+            # DashScope keys start with "sk-"
+            if not api_key.startswith("sk-"):
+                return False
+
+            # Try to reach the DashScope API
+            with httpx.Client(timeout=5.0) as client:
+                response = client.get(
+                    "https://dashscope.aliyuncs.com/api/v1/services",
+                    headers={"Authorization": f"Bearer {api_key}"}
+                )
+                # Any response (including 401/403/404) means the service is reachable
+                return True
+        except Exception as e:
+            logger.debug("DashScope key validation failed: %s", e)
+            return False
+
     def _init_stt(self) -> STTEngine | STTApiEngine | STTRealtimeApiEngine:
         """Create an STT engine from the current config."""
         cfg = self._config.stt
 
-        if cfg.backend == "api" and cfg.api_base_url and cfg.api_key:
+        if cfg.backend == "api":
             logger.info("Using API STT backend (%s)", cfg.api_model)
             return STTApiEngine(
                 base_url=cfg.api_base_url,
@@ -1521,22 +1781,16 @@ class UnTypeApp:
             )
 
         if cfg.backend == "realtime_api":
-            # Use realtime_api_key if set, otherwise fall back to api_key
             api_key = cfg.realtime_api_key or cfg.api_key
-            if api_key:
-                logger.info("Using Realtime API STT backend (%s)", cfg.realtime_api_model)
-                return STTRealtimeApiEngine(
-                    api_key=api_key,
-                    model=cfg.realtime_api_model,
-                    language=cfg.language,
-                    format=cfg.realtime_api_format,
-                    sample_rate=cfg.realtime_api_sample_rate,
-                    on_text_update=self._on_realtime_text_update,
-                )
-            else:
-                logger.warning(
-                    "Realtime API selected but no API key configured, falling back to local"
-                )
+            logger.info("Using Realtime API STT backend (%s)", cfg.realtime_api_model)
+            return STTRealtimeApiEngine(
+                api_key=api_key,
+                model=cfg.realtime_api_model,
+                language=cfg.language,
+                format=cfg.realtime_api_format,
+                sample_rate=cfg.realtime_api_sample_rate,
+                on_text_update=self._on_realtime_text_update,
+            )
 
         logger.info("Using local STT backend (model=%s)", cfg.model_size)
         return STTEngine(
@@ -1591,8 +1845,32 @@ def main() -> None:
     # Setup logging
     _setup_logging()
 
+    # Check if first run and show setup wizard
+    if is_first_run():
+        logger.info("First run detected, launching setup wizard...")
+        _run_first_run_wizard()
+
     app = UnTypeApp()
     app.run()
+
+
+def is_first_run() -> bool:
+    """Check if this is the first run of UnType."""
+    from untype.wizard import is_first_run as _is_first_run
+    return _is_first_run()
+
+
+def _run_first_run_wizard() -> None:
+    """Run the first-run setup wizard."""
+    from untype.wizard import run_setup_wizard
+    from untype.config import load_config
+
+    config = load_config()
+
+    def on_wizard_complete(updated_config: AppConfig) -> None:
+        logger.info("Setup wizard completed, configuration updated")
+
+    run_setup_wizard(config, on_wizard_complete)
 
 
 def _setup_logging() -> None:

@@ -80,6 +80,7 @@
     "persona.model": "模型:",
     "persona.temperature": "温度:",
     "persona.max_tokens": "最大令牌:",
+    "persona.active": "激活（录音时显示）",
     "persona.prompt_insert": "插入提示词:",
     "persona.prompt_polish": "润色提示词:",
     "persona.save": "保存",

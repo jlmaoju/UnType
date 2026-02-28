@@ -132,6 +132,7 @@ class Persona:
     id: str
     name: str
     icon: str  # emoji, e.g. "📚"
+    active: bool = True  # whether this persona is shown during recording
     prompt_polish: str = ""  # system prompt for polish mode (empty = use global)
     prompt_insert: str = ""  # system prompt for insert mode (empty = use global)
     model: str = ""  # override LLM model (empty = use global)

@@ -80,6 +80,7 @@
     "persona.model": "Model:",
     "persona.temperature": "Temperature:",
     "persona.max_tokens": "Max Tokens:",
+    "persona.active": "Active (show during recording)",
     "persona.prompt_insert": "Insert Prompt:",
     "persona.prompt_polish": "Polish Prompt:",
     "persona.save": "Save",

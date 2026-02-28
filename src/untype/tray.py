@@ -209,6 +209,15 @@ class SettingsDialog:
                 t("settings.stt_realtime_api_model"),
             ]
 
+            # Warn when selecting local mode (model download required)
+            if backend == "local" and self._config.stt.backend != "local":
+                import tkinter.messagebox as messagebox
+                messagebox.showwarning(
+                    "本地模型提示",
+                    "本地模式需要下载 Whisper 模型（约 500MB），请确保网络环境正常。\n\n"
+                    "首次使用时会自动从 HuggingFace 下载模型，可能需要几分钟时间。"
+                )
+
             for label_text, (label_widget, input_widget) in stt_field_labels.items():
                 should_show = (
                     (label_text in api_fields and backend == "api")
