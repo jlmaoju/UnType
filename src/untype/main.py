@@ -1876,58 +1876,52 @@ def _run_first_run_wizard() -> None:
 
 def _show_tray_notification() -> None:
     """Show a bubble notification near the system tray after wizard completion."""
-    try:
-        import tkinter as tk
-        import threading
-        import time
+    import threading
 
-        def show_notification():
-            # Wait for wizard to fully close
-            time.sleep(1.0)
+    def _show_notification() -> None:
+        try:
+            import tkinter as tk
+            import time
 
-            # Create a toplevel window for the notification
+            # Wait for wizard to fully close and main app to start
+            time.sleep(1.5)
+
+            # Create notification window
             notif = tk.Tk()
-            notif.withdraw()  # Hide from taskbar
+            notif.withdraw()
             notif.attributes("-topmost", True)
-            notif.attributes("-toolwindow", True)  # Don't show in taskbar
-            notif.overrideredirect(True)  # Remove window decorations
+            notif.attributes("-toolwindow", True)
+            notif.overrideredirect(True)
 
-            # Set background color (dark)
+            # Dark theme colors
             bg_color = "#2d2d2d"
             fg_color = "#e0e0e0"
             accent_color = "#4CAF50"
+            border_color = "#4CAF50"
 
-            # Notification frame
-            notif_frame = tk.Frame(notif, bg=bg_color, relief="solid", borderwidth=1)
-            notif_frame.pack(padx=15, pady=15)
+            # Main frame
+            main = tk.Frame(notif, bg=bg_color, relief="solid", borderwidth=2)
+            main.config(highlightbackground=border_color, highlightcolor=border_color)
+            main.pack(padx=0, pady=0)
 
             # Content
-            content_frame = tk.Frame(notif_frame, bg=bg_color)
-            content_frame.pack()
+            content = tk.Frame(main, bg=bg_color)
+            content.pack(fill="both", expand=True, padx=20, pady=15)
 
-            # Icon and title row
-            row1 = tk.Frame(content_frame, bg=bg_color)
-            row1.pack(fill="x", pady=(0, 8))
-
-            tk.Label(
-                row1,
-                text="✅",
-                font=("Segoe UI Emoji", 14),
-                bg=bg_color,
-                fg=accent_color,
-            ).pack(side="left", padx=(0, 8))
+            # Icon and title
+            top = tk.Frame(content, bg=bg_color)
+            top.pack(fill="x", pady=(0, 10))
 
             tk.Label(
-                row1,
-                text="配置完成！",
+                top,
+                text="✅ 配置完成！",
                 font=("Microsoft YaHei UI", 11, "bold"),
                 bg=bg_color,
                 fg=fg_color,
-            ).pack(side="left")
+            ).pack()
 
-            # Message
             tk.Label(
-                content_frame,
+                content,
                 text="我在右下角状态栏 👇",
                 font=("Microsoft YaHei UI", 9),
                 bg=bg_color,
@@ -1935,35 +1929,43 @@ def _show_tray_notification() -> None:
             ).pack(pady=(0, 5))
 
             tk.Label(
-                content_frame,
+                content,
                 text="按 F6 开始使用",
                 font=("Microsoft YaHei UI", 9),
                 bg=bg_color,
                 fg=accent_color,
             ).pack()
 
-            # Position near bottom right corner
-            screen_width = notif.winfo_screenwidth()
-            screen_height = notif.winfo_screenheight()
+            # Position at bottom right
             notif.update_idletasks()
+            screen_w = notif.winfo_screenwidth()
+            screen_h = notif.winfo_screenheight()
 
-            notif_width = 200
-            notif_height = 100
+            notif_width = 220
+            notif_height = 110
 
-            x = screen_width - notif_width - 20
-            y = screen_height - notif_height - 60  # Above taskbar
-            notif.geometry(f"+{x}+{y}")
+            x = screen_w - notif_width - 15
+            y = screen_h - notif_height - 50
 
-            # Auto-dismiss after 5 seconds
-            notif.after(5000, notif.destroy)
+            notif.geometry(f"{notif_width}x{notif_height}+{x}+{y}")
+            notif.deiconify()
+
+            # Auto-dismiss with cleanup
+            def close_notif():
+                try:
+                    notif.destroy()
+                except Exception:
+                    pass
+
+            notif.after(5000, close_notif)
             notif.mainloop()
 
-        # Run in separate thread to not block main app
-        thread = threading.Thread(target=show_notification, daemon=True, name="tray-notification")
-        thread.start()
+        except Exception as e:
+            logger.warning("Failed to show tray notification: %s", e)
 
-    except Exception as e:
-        logger.warning("Failed to show tray notification: %s", e)
+    # Run in daemon thread so it doesn't block the main app
+    thread = threading.Thread(target=_show_notification, daemon=True)
+    thread.start()
 
 
 def _setup_logging() -> None:

@@ -387,7 +387,7 @@ class SetupWizard:
             text="请选择您偏好的语音识别模式：",
             font=("Microsoft YaHei UI", 10),
             bg="#252525",
-            fg="#666666",
+            fg="#90a4ae",
         ).pack(pady=(0, 20))
 
         # Initialize temp config if needed
@@ -505,7 +505,7 @@ class SetupWizard:
             text="请输入您的阿里云 DashScope API 密钥：",
             font=("Microsoft YaHei UI", 10),
             bg="#252525",
-            fg="#666666",
+            fg="#90a4ae",
         ).pack(pady=(0, 20))
 
         # API Key input
@@ -522,7 +522,7 @@ class SetupWizard:
             text="API 密钥",
             font=("Microsoft YaHei UI", 10),
             bg="#252525",
-            fg="#555555",
+            fg="#b0bec5",
         ).pack(anchor="w")
 
         entry = tk.Entry(
@@ -530,20 +530,25 @@ class SetupWizard:
             textvariable=self._page_vars["realtime_api_key"],
             font=("Microsoft YaHei UI", 10),
             show="*",
+            bg="#1e1e1e",
+            fg="#e0e0e0",
+            insertbackground="#e0e0e0",
+            relief="solid",
+            borderwidth=1,
         )
         entry.pack(fill="x", pady=(5, 0))
         entry.bind("<FocusOut>", lambda e: self._verify_api_key())
 
         # Help text
-        help_frame = tk.Frame(frame, bg="#f0f8ff", padx=15, pady=12)
+        help_frame = tk.Frame(frame, bg="#1e1e1e", padx=15, pady=12)
         help_frame.pack(fill="x", pady=(0, 20))
 
         tk.Label(
             help_frame,
             text="💡 如何获取 API 密钥？",
-            font=("Microsoft YaHei UI", 10, "bold"),
-            bg="#f0f8ff",
-            fg="#e0e0e0",
+            font=("Microsoft Yahe i UI", 10, "bold"),
+            bg="#1e1e1e",
+            fg="#90caf9",
         ).pack(anchor="w")
 
         steps = [
@@ -556,8 +561,8 @@ class SetupWizard:
                 help_frame,
                 text=step,
                 font=("Microsoft YaHei UI", 9),
-                bg="#f0f8ff",
-                fg="#666666",
+                bg="#1e1e1e",
+                fg="#b0bec5",
             ).pack(anchor="w", pady=2)
 
         tk.Button(
@@ -621,15 +626,21 @@ class SetupWizard:
                 text=label,
                 font=("Microsoft YaHei UI", 10),
                 bg="#252525",
-                fg="#555555",
+                fg="#b0bec5",
             ).pack(anchor="w")
 
-            tk.Entry(
+            entry = tk.Entry(
                 field_frame,
                 textvariable=self._page_vars[var_key],
-                font=("Microsoft YaHei UI", 10),
+                font=("Microsoft Yahei UI", 10),
                 show="*" if "key" in var_key else None,
-            ).pack(fill="x", pady=(5, 0))
+                bg="#1e1e1e",
+                fg="#e0e0e0",
+                insertbackground="#e0e0e0",
+                relief="solid",
+                borderwidth=1,
+            )
+            entry.pack(fill="x", pady=(5, 0))
 
     def _page_stt_config_local(self, parent: tk.Frame) -> None:
         """Show local model config page (Page 2 - local)."""
@@ -649,7 +660,7 @@ class SetupWizard:
             text="本地模式需要下载 Whisper 模型：",
             font=("Microsoft YaHei UI", 10),
             bg="#252525",
-            fg="#666666",
+            fg="#90a4ae",
         ).pack(pady=(0, 20))
 
         # Model selection
@@ -661,14 +672,14 @@ class SetupWizard:
             self._page_vars["model_downloaded"] = self._create_boolean_var(value=self._check_local_model_exists("small"))
 
         # Info card
-        info_frame = tk.Frame(frame, bg="#f0f0f0", padx=15, pady=12)
+        info_frame = tk.Frame(frame, bg="#1e1e1e", padx=15, pady=12)
         info_frame.pack(fill="x", pady=(0, 20))
 
         tk.Label(
             info_frame,
             text="模型大小：small (推荐)",
             font=("Microsoft YaHei UI", 10, "bold"),
-            bg="#f0f0f0",
+            bg="#1e1e1e",
             fg="#e0e0e0",
         ).pack(anchor="w")
 
@@ -676,8 +687,8 @@ class SetupWizard:
             info_frame,
             text="• 下载大小：约 500MB  • 适合日常使用  • CPU 运行流畅",
             font=("Microsoft YaHei UI", 9),
-            bg="#f0f0f0",
-            fg="#666666",
+            bg="#1e1e1e",
+            fg="#90a4ae",
         ).pack(anchor="w", pady=(5, 0))
 
         # Model size selection
@@ -686,7 +697,7 @@ class SetupWizard:
             text="选择模型大小：",
             font=("Microsoft YaHei UI", 10),
             bg="#252525",
-            fg="#555555",
+            fg="#b0bec5",
         ).pack(anchor="w", pady=(0, 10))
 
         models = [
@@ -742,7 +753,7 @@ class SetupWizard:
             text="正在下载...",
             font=("Microsoft YaHei UI", 9),
             bg="#252525",
-            fg="#666666",
+            fg="#90a4ae",
         )
         self._progress_bar = ttk.Progressbar(
             self._progress_frame,
@@ -808,7 +819,7 @@ class SetupWizard:
             text="UnType 使用 AI 在转录后润色文本，这是核心功能。",
             font=("Microsoft YaHei UI", 10),
             bg="#252525",
-            fg="#666666",
+            fg="#90a4ae",
         ).pack(pady=(0, 20))
 
         # Initialize variables
@@ -835,26 +846,32 @@ class SetupWizard:
                 text=label,
                 font=("Microsoft YaHei UI", 10),
                 bg="#252525",
-                fg="#555555",
+                fg="#b0bec5",
             ).pack(anchor="w")
 
-            tk.Entry(
+            entry = tk.Entry(
                 field_frame,
                 textvariable=self._page_vars[var_key],
-                font=("Microsoft YaHei UI", 10),
+                font=("Microsoft Yahei UI", 10),
                 show="*" if "key" in var_key else None,
-            ).pack(fill="x", pady=(5, 0))
+                bg="#1e1e1e",
+                fg="#e0e0e0",
+                insertbackground="#e0e0e0",
+                relief="solid",
+                borderwidth=1,
+            )
+            entry.pack(fill="x", pady=(5, 0))
 
         # Help text
-        help_frame = tk.Frame(frame, bg="#fff8e1", padx=15, pady=12)
+        help_frame = tk.Frame(frame, bg="#1e1e1e", padx=15, pady=12)
         help_frame.pack(fill="x", pady=(10, 0))
 
         tk.Label(
             help_frame,
             text="💡 使用任何兼容 OpenAI API 格式的服务",
             font=("Microsoft YaHei UI", 9),
-            bg="#fff8e1",
-            fg="#666666",
+            bg="#1e1e1e",
+            fg="#90a4ae",
         ).pack(anchor="w")
 
     def _page_llm_verify(self, parent: tk.Frame) -> None:
@@ -895,7 +912,7 @@ class SetupWizard:
             text="现在可以开始使用 UnType 了",
             font=("Microsoft YaHei UI", 11),
             bg="#252525",
-            fg="#666666",
+            fg="#90a4ae",
         ).pack(pady=(0, 25))
 
         # How to use
@@ -923,7 +940,7 @@ class SetupWizard:
                 text=step,
                 font=("Microsoft YaHei UI", 9),
                 bg="#f9f9f9",
-                fg="#555555",
+                fg="#b0bec5",
             ).pack(anchor="w", pady=3)
 
         # Tips
@@ -935,7 +952,7 @@ class SetupWizard:
             text="💡 小技巧：",
             font=("Microsoft YaHei UI", 10, "bold"),
             bg="#252525",
-            fg="#555555",
+            fg="#b0bec5",
         ).pack(anchor="w")
 
         tips = [
@@ -1181,7 +1198,7 @@ class SetupWizard:
                 text="配置完成！可以继续下一步了。",
                 font=("Microsoft YaHei UI", 10),
                 bg="#252525",
-                fg="#666666",
+                fg="#90a4ae",
             ).pack()
 
             self._page_vars["stt_verified"] = True
@@ -1407,7 +1424,7 @@ class SetupWizard:
                 text="配置完成！可以继续下一步了。",
                 font=("Microsoft YaHei UI", 10),
                 bg="#252525",
-                fg="#666666",
+                fg="#90a4ae",
             ).pack()
 
             self._page_vars["llm_verified"] = True
@@ -1467,7 +1484,7 @@ class SetupWizard:
             text="选择您想要激活的人格面具（录音时可见）",
             font=("Microsoft YaHei UI", 10),
             bg="#252525",
-            fg="#666666",
+            fg="#90a4ae",
         ).pack(pady=(0, 20))
 
         # Load available personas
@@ -1557,14 +1574,14 @@ class SetupWizard:
             ).pack(pady=20)
 
         # Help text at bottom
-        help_frame = tk.Frame(frame, bg="#f0f8ff", padx=15, pady=12)
+        help_frame = tk.Frame(frame, bg="#1e1e1e", padx=15, pady=12)
         help_frame.pack(fill="x", pady=(15, 0))
 
         tk.Label(
             help_frame,
             text="💡 提示",
             font=("Microsoft YaHei UI", 10, "bold"),
-            bg="#f0f8ff",
+            bg="#1e1e1e",
             fg="#e0e0e0",
         ).pack(anchor="w")
 
@@ -1572,8 +1589,8 @@ class SetupWizard:
             help_frame,
             text="• 只有激活的人格面具才会在录音时显示\n• 之后可以在设置中添加自定义人格面具",
             font=("Microsoft YaHei UI", 9),
-            bg="#f0f8ff",
-            fg="#666666",
+            bg="#1e1e1e",
+            fg="#90a4ae",
             justify="left",
         ).pack(anchor="w", pady=(5, 0))
 
