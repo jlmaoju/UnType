@@ -322,18 +322,21 @@ def save_config(config: AppConfig) -> None:
         shutil.copy2(path, backup_path)
 
     data = _config_to_dict(config)
+    temp_path = path.with_suffix(".toml.tmp")
     try:
-        # Write to a temporary file first, then atomic rename
-        temp_path = path.with_suffix(".toml.tmp")
+        # Write to a temporary file first, then replace the live config only
+        # after the new contents are fully flushed to disk.
         with open(temp_path, "wb") as f:
             tomli_w.dump(data, f)
 
-        # Atomic replace on Windows
-        if path.exists():
-            path.unlink()
         temp_path.replace(path)
 
     except Exception:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
         # Restore from backup if save failed
         if backup_path.exists():
             import shutil

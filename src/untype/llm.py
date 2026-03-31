@@ -73,15 +73,40 @@ class LLMClient:
         self.prompts = {**_DEFAULT_PROMPTS, **(prompts or {})}
 
         self._base_url = base_url.rstrip("/")
-        self._client = httpx.Client(
+        self._api_key = api_key
+        self._client = self._create_http_client()
+
+    def _create_http_client(self) -> httpx.Client:
+        """Create a configured HTTP client for chat-completion requests."""
+        return httpx.Client(
             base_url=self._base_url,
             headers={
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
             },
             timeout=httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=30.0),
             verify=True,
         )
+
+    def _build_payload(
+        self,
+        system: str,
+        user: str,
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> dict:
+        """Build the chat-completion payload for a single request."""
+        return {
+            "model": model or self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": temperature if temperature is not None else self.temperature,
+            "max_tokens": max_tokens if max_tokens is not None else self.max_tokens,
+        }
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -175,15 +200,13 @@ class LLMClient:
             httpx.TimeoutException: On timeout.
             KeyboardInterrupt: If the request is cancelled via *cancel_event*.
         """
-        payload = {
-            "model": model or self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": temperature if temperature is not None else self.temperature,
-            "max_tokens": max_tokens if max_tokens is not None else self.max_tokens,
-        }
+        payload = self._build_payload(
+            system,
+            user,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
 
         # If no cancel event, use simple synchronous request
         if cancel_event is None:
@@ -210,6 +233,10 @@ class LLMClient:
                         self._client.close()
                     except Exception:
                         pass
+                    finally:
+                        # Cancellation closes the shared client, so recreate it
+                        # for the next request instead of leaving the instance unusable.
+                        self._client = self._create_http_client()
                     # Shutdown the executor
                     executor.shutdown(wait=False)
                     raise KeyboardInterrupt("LLM request cancelled")

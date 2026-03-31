@@ -322,6 +322,10 @@ class CapsuleOverlay:
         self._staging_event.clear()
         self._queue.put(("STAGING_SHOW", text, x, y, at_corner, personas))
 
+    def cancel_staging(self) -> None:
+        """Cancel the current staging interaction, if any."""
+        self._queue.put(("STAGING_CANCEL",))
+
     def wait_staging(self) -> tuple[str, str]:
         """Block until the user acts on the staging area.
 
@@ -699,6 +703,8 @@ class CapsuleOverlay:
         elif op == "STAGING_SHOW":
             _, text, x, y, at_corner, personas = cmd
             self._do_show_staging(text, x, y, at_corner, personas)
+        elif op == "STAGING_CANCEL":
+            self._do_cancel_staging()
         elif op == "REC_PERSONAS_SHOW":
             _, personas, x, y, on_click = cmd
             self._do_show_recording_personas(personas, x, y, on_click)
@@ -1014,8 +1020,7 @@ class CapsuleOverlay:
             # Unblock any pipeline thread waiting on staging
             # (ensure _staging_event exists before trying to set it)
             if hasattr(self, "_staging_event") and self._staging_event is not None:
-                self._staging_result_action = "cancel"
-                self._staging_event.set()
+                self._do_cancel_staging()
 
             # Quit and destroy the main window with exception handling
             try:
@@ -1834,8 +1839,7 @@ class CapsuleOverlay:
         root = self._root
         if root is None:
             # Unblock waiter so the pipeline thread never hangs.
-            self._staging_result_action = "cancel"
-            self._staging_event.set()
+            self._do_cancel_staging()
             return
 
         # Destroy previous staging area if any.
@@ -2033,6 +2037,16 @@ class CapsuleOverlay:
         else:
             self._staging_result_text = ""
         self._staging_result_action = action
+        self._do_hide_staging()
+        self._staging_event.set()
+
+    def _do_cancel_staging(self) -> None:
+        """Cancel the current staging interaction and unblock waiters."""
+        if self._staging_text_widget is not None:
+            self._resolve_staging("cancel")
+            return
+        self._staging_result_text = ""
+        self._staging_result_action = "cancel"
         self._do_hide_staging()
         self._staging_event.set()
 

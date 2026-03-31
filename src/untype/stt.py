@@ -372,9 +372,8 @@ class STTRealtimeApiEngine:
             audio: Float32 numpy array at the configured sample rate.
                    Recommended chunk size: 100ms (1600 samples at 16kHz).
         """
-        # Check if session is ready (either active or waiting for connection)
-        if not self._session_active and not self._session_ready.is_set():
-            logger.warning("No active session, cannot send audio")
+        if not self._session_active or self._recognition is None:
+            logger.debug("Ignoring audio chunk because realtime session is not active")
             return
 
         # Convert to PCM16 bytes

@@ -31,6 +31,10 @@ from untype.tray import TrayApp
 
 logger = logging.getLogger(__name__)
 
+_CONFIG_SAVE_DEBOUNCE_S = 0.25
+_CAPTURE_CLEANUP_TIMEOUT_S = 2.0
+_REALTIME_STOP_TIMEOUT_S = 3.0
+
 
 class UnTypeApp:
     """Main application orchestrator.
@@ -99,6 +103,11 @@ class UnTypeApp:
         self._last_target_window: WindowIdentity | None = None
         self._last_caret_x: int = 0
         self._last_caret_y: int = 0
+
+        # -- Config persistence -----------------------------------------------
+        self._config_save_lock = threading.Lock()
+        self._config_save_timer: threading.Timer | None = None
+        self._config_save_generation = 0
 
         # -- Initialise subsystems -------------------------------------------
         logger.info("Initialising audio recorder...")
@@ -231,9 +240,7 @@ class UnTypeApp:
                 pyperclip.copy(self._held_result)
             except Exception:
                 pass
-            self._held_result = None
-            self._held_clipboard = None
-            self._overlay.hide_hold_bubble()
+            self._take_held_result(hide_bubble=True)
 
         self._press_active = True
         self._recording_started.clear()
@@ -276,24 +283,7 @@ class UnTypeApp:
         # Note: Don't call recorder.stop() here - it can deadlock if the audio
         # callback is in progress. Let the pipeline thread handle cleanup.
 
-        # Deactivate digit interceptor.
-        self._digit_interceptor.set_active(False)
-
-        # Stop HWND watcher.
-        self._hwnd_watch_active = False
-
-        # Hide all overlays.
-        self._overlay.hide()
-        self._overlay.hide_recording_personas()
-        self._overlay.hide_hold_bubble()
-
-        # Force-unblock staging if it's waiting.
-        self._overlay._staging_result_action = "cancel"
-        self._overlay._staging_result_text = ""
-        self._overlay._staging_event.set()
-
-        # Update tray status.
-        self._tray.update_status("Ready")
+        self._reset_interaction_ui(hide_hold_bubble=True, cancel_staging=True)
 
         # CRITICAL: If user cancelled while still holding the hotkey,
         # start cleanup immediately instead of waiting for hotkey release.
@@ -316,24 +306,10 @@ class UnTypeApp:
             if not self._recording_started.wait(timeout=5.0):
                 logger.warning("Cleanup after cancel: timeout waiting for recording start")
 
-            # CRITICAL: Ensure recorder is stopped even if _process_pipeline won't run
-            if self._recorder.is_recording:
-                try:
-                    self._recorder.abort()
-                except Exception:
-                    pass
-
-            # Also stop realtime STT session if active
-            try:
-                if isinstance(self._stt, STTRealtimeApiEngine):
-                    self._stt.stop_session()
-            except Exception:
-                pass
+            self._cleanup_active_capture()
         finally:
             # Always release the lock
-            self._hwnd_watch_active = False
-            self._digit_interceptor.set_active(False)
-            self._cancel_requested.clear()
+            self._reset_pipeline_runtime_state()
             self._pipeline_lock.release()
             logger.debug("Cleanup after cancel: lock released")
 
@@ -388,7 +364,10 @@ class UnTypeApp:
                     else:
                         logger.warning("Failed to establish realtime recognition session")
                         self._overlay.update_status("连接失败，请检查网络")
-                        # Don't abort - fall through to recording anyway
+                        self._tray.update_status("Error")
+                        time.sleep(1.5)
+                        self._reset_interaction_ui()
+                        return
 
             # Start recording. For non-realtime backends, this happens first.
             # For realtime, we wait for the session to be ready.
@@ -482,70 +461,20 @@ class UnTypeApp:
             # Checkpoint: cancel requested during recording start?
             if self._cancel_requested.is_set():
                 logger.info("Pipeline cancelled after recording start - initiating cleanup")
-                # CRITICAL: Must abort the recorder immediately when cancelled
-                # Use ThreadPoolExecutor with timeout to avoid blocking
-                import concurrent.futures
-
-                def _cleanup_resources():
-                    if self._recorder.is_recording:
-                        logger.debug("Cleanup: aborting recorder")
-                        self._recorder.abort()
-                    if isinstance(self._stt, STTRealtimeApiEngine):
-                        logger.debug("Cleanup: stopping STT session")
-                        self._stt.stop_session()
-                    logger.debug("Cleanup: complete")
-
-                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                try:
-                    future = executor.submit(_cleanup_resources)
-                    future.result(timeout=2.0)  # Max 2 seconds for cleanup
-                except concurrent.futures.TimeoutError:
-                    logger.warning("Cleanup timed out - proceeding anyway")
-                except Exception as e:
-                    logger.warning("Cleanup error: %s", e)
-                finally:
-                    executor.shutdown(wait=False)
+                self._cleanup_active_capture()
+                self._reset_interaction_ui()
                 return
 
             if not self._recorder.is_recording:
                 logger.warning("Recording not active — aborting pipeline")
-                self._digit_interceptor.set_active(False)
-                self._overlay.hide_recording_personas()
-                self._tray.update_status("Ready")
-                self._overlay.hide()
+                self._reset_interaction_ui()
                 return
 
             # Checkpoint: cancel requested before stopping recording?
             if self._cancel_requested.is_set():
                 logger.info("Pipeline cancelled before recording stop - initiating cleanup")
-                # CRITICAL: Must abort the recorder immediately when cancelled
-                # Use ThreadPoolExecutor with timeout to avoid blocking
-                import concurrent.futures
-
-                def _cleanup_resources():
-                    if self._recorder.is_recording:
-                        logger.debug("Cleanup: aborting recorder")
-                        self._recorder.abort()
-                    if isinstance(self._stt, STTRealtimeApiEngine):
-                        logger.debug("Cleanup: stopping STT session")
-                        self._stt.stop_session()
-
-                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                try:
-                    future = executor.submit(_cleanup_resources)
-                    future.result(timeout=2.0)  # Max 2 seconds for cleanup
-                except concurrent.futures.TimeoutError:
-                    logger.warning("Cleanup timed out - proceeding anyway")
-                except Exception as e:
-                    logger.warning("Cleanup error: %s", e)
-                finally:
-                    executor.shutdown(wait=False)
-
-                self._digit_interceptor.set_active(False)
-                self._overlay.hide_recording_personas()
-                self._overlay.hide_realtime_preview()
-                self._tray.update_status("Ready")
-                self._overlay.hide()
+                self._cleanup_active_capture()
+                self._reset_interaction_ui()
                 return
 
             # 1. Stop recording and retrieve audio.
@@ -556,51 +485,25 @@ class UnTypeApp:
             # Checkpoint: cancel requested during recording stop?
             if self._cancel_requested.is_set():
                 logger.info("Pipeline cancelled after recording stop")
+                self._reset_interaction_ui()
                 return
 
             if audio.size == 0:
                 logger.warning("Empty audio buffer — aborting pipeline")
-                self._digit_interceptor.set_active(False)
-                self._overlay.hide_recording_personas()
-                self._overlay.hide_realtime_preview()
-                self._tray.update_status("Ready")
-                self._overlay.hide()
+                self._reset_interaction_ui()
                 return
 
             # 2. Transcribe (or get realtime result).
             # IMPORTANT: Check cancel before STT processing
             if self._cancel_requested.is_set():
                 logger.info("Pipeline cancelled before STT processing")
-                # Still need to cleanup
-                try:
-                    if isinstance(self._stt, STTRealtimeApiEngine):
-                        self._stt.stop_session()
-                except Exception:
-                    pass
-                self._digit_interceptor.set_active(False)
-                self._overlay.hide_recording_personas()
-                self._overlay.hide_realtime_preview()
-                self._tray.update_status("Ready")
-                self._overlay.hide()
+                self._cleanup_active_capture()
+                self._reset_interaction_ui()
                 return
 
             if self._config.stt.backend == "realtime_api":
-                # For realtime API, use ThreadPoolExecutor to prevent blocking
                 logger.info("Stopping realtime recognition session...")
-                if isinstance(self._stt, STTRealtimeApiEngine):
-                    import concurrent.futures
-
-                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                    try:
-                        future = executor.submit(self._stt.stop_session)
-                        text = future.result(timeout=3.0)  # 3 second timeout
-                    except concurrent.futures.TimeoutError:
-                        logger.warning("STT stop_session timed out - forcing cleanup")
-                        text = self._stt.get_result()
-                    finally:
-                        executor.shutdown(wait=False)
-                else:
-                    text = ""
+                text = self._get_realtime_result()
                 text = text.strip()
             else:
                 # For API and local backends, normalize and transcribe.
@@ -616,15 +519,12 @@ class UnTypeApp:
             # Checkpoint: cancel requested during transcription?
             if self._cancel_requested.is_set():
                 logger.info("Pipeline cancelled after transcription")
+                self._reset_interaction_ui()
                 return
 
             if not text:
                 logger.warning("Empty transcription — aborting pipeline")
-                self._digit_interceptor.set_active(False)
-                self._overlay.hide_recording_personas()
-                self._overlay.hide_realtime_preview()
-                self._tray.update_status("Ready")
-                self._overlay.hide()
+                self._reset_interaction_ui()
                 return
 
             logger.info("Transcription: %s", text)
@@ -703,6 +603,54 @@ class UnTypeApp:
             logger.exception("LLM request failed — falling back to raw transcription")
             return transcribed_text
 
+    def _show_processing_ui(self, *, at_corner: bool = False) -> None:
+        """Show the processing capsule in its normal or parked state."""
+        self._hwnd_watch_active = False
+        if at_corner:
+            self._overlay.update_status("Processing...")
+        else:
+            self._overlay.show(self._caret_x, self._caret_y, "Processing...")
+        self._tray.update_status("Processing...")
+
+    def _run_llm_with_watch(
+        self,
+        llm_input: str,
+        *,
+        persona: Persona | None = None,
+        at_corner: bool = False,
+        cancel_before_message: str,
+        cancel_during_message: str,
+        cancel_after_message: str,
+        error_message: str,
+    ) -> str | None:
+        """Run an LLM request with shared processing UI and cancellation handling."""
+        self._show_processing_ui(at_corner=at_corner)
+        self._start_hwnd_watcher()
+
+        if self._cancel_requested.is_set():
+            logger.info(cancel_before_message)
+            self._reset_interaction_ui()
+            return None
+
+        try:
+            result = self._run_llm(llm_input, persona=persona)
+        except KeyboardInterrupt:
+            logger.info(cancel_during_message)
+            self._reset_interaction_ui()
+            return None
+        except Exception:
+            logger.exception(error_message)
+            self._reset_interaction_ui()
+            return None
+
+        if self._cancel_requested.is_set():
+            logger.info(cancel_after_message)
+            self._reset_interaction_ui()
+            return None
+
+        self._hwnd_watch_active = False
+        return result
+
     def _process_with_personas(self, text: str) -> None:
         """Fast-lane: skip staging, go directly to LLM (with optional persona).
 
@@ -720,69 +668,23 @@ class UnTypeApp:
         self._hwnd_watch_active = False
         at_corner = self._window_mismatch
 
-        if at_corner:
-            # Capsule is already parked at the corner from a prior HWND
-            # mismatch — just update its status text in place.
-            self._overlay.update_status("Processing...")
-        else:
-            self._overlay.show(self._caret_x, self._caret_y, "Processing...")
-        self._tray.update_status("Processing...")
-
-        # Restart HWND monitoring during the LLM call.
-        self._start_hwnd_watcher()
-
-        # Check if cancel was already requested before starting LLM
-        if self._cancel_requested.is_set():
-            logger.info("Pipeline cancelled before LLM call (fast-lane)")
-            self._hwnd_watch_active = False
-            self._overlay.hide()
-            self._tray.update_status("Ready")
+        result = self._run_llm_with_watch(
+            text,
+            persona=persona,
+            at_corner=at_corner,
+            cancel_before_message="Pipeline cancelled before LLM call (fast-lane)",
+            cancel_during_message="Pipeline cancelled during LLM (fast-lane)",
+            cancel_after_message="Pipeline cancelled after LLM returned (fast-lane)",
+            error_message="Pipeline error in _process_with_personas",
+        )
+        if result is None:
             return
 
-        try:
-            result = self._run_llm(text, persona=persona)
-        except KeyboardInterrupt:
-            # LLM request was cancelled by user
-            logger.info("Pipeline cancelled during LLM (fast-lane)")
-            self._hwnd_watch_active = False
-            self._overlay.hide()
-            self._tray.update_status("Ready")
-            return
-        except Exception as e:
-            logger.exception(f"Pipeline error in _process_with_personas: {e}")
-            self._hwnd_watch_active = False
-            self._overlay.hide()
-            self._tray.update_status("Ready")
-            return
-
-        # IMPORTANT: Check cancel again immediately after LLM returns
-        # User may have cancelled while LLM was processing (HTTP may have completed)
-        if self._cancel_requested.is_set():
-            logger.info("Pipeline cancelled after LLM returned (fast-lane)")
-            self._hwnd_watch_active = False
-            self._overlay.hide()
-            self._tray.update_status("Ready")
-            return
-
-        # Stop watcher and verify window before injection.
+        # Stop watcher before the unified delivery step.
         self._hwnd_watch_active = False
-        if not self._verify_window_safety():
-            logger.warning(
-                "Window changed during LLM processing — holding result",
-            )
-            self._save_interaction_state(text, result, persona=persona, show_ghost=False)
-            self._held_result = result
-            self._held_clipboard = self._original_clipboard
-            self._overlay.fly_to_hold_bubble(result)
-            self._tray.update_status("Ready")
-            return
-
         logger.info("Injecting refined text (%d chars)", len(result))
-        inject_text(result, self._original_clipboard)
-        self._save_interaction_state(text, result, persona=persona)
-        self._overlay.hide()
-        self._tray.update_status("Ready")
-        logger.info("Pipeline complete (fast-lane)")
+        if self._deliver_result(text, result, persona=persona):
+            logger.info("Pipeline complete (fast-lane)")
 
     def _process_with_staging(self, text: str) -> None:
         """Show staging area for manual editing (no personas configured)."""
@@ -816,60 +718,25 @@ class UnTypeApp:
 
         if action == "raw":
             logger.info("Injecting raw text (%d chars)", len(edited_text))
-            inject_text(edited_text, self._original_clipboard)
-            self._save_interaction_state(text, edited_text)
+            self._deliver_result(text, edited_text)
             return
 
         # action == "refine" — send through LLM.
-        self._overlay.show(self._caret_x, self._caret_y, "Processing...")
-        self._tray.update_status("Processing...")
-
-        # Restart HWND monitoring during the LLM call.
-        self._start_hwnd_watcher()
-
-        try:
-            result = self._run_llm(edited_text)
-        except KeyboardInterrupt:
-            # LLM request was cancelled by user
-            logger.info("Pipeline cancelled during LLM (staging)")
-            self._hwnd_watch_active = False
-            self._overlay.hide()
-            self._tray.update_status("Ready")
-            return
-        except Exception as e:
-            logger.exception(f"Pipeline error in _process_with_staging LLM: {e}")
-            self._hwnd_watch_active = False
-            self._overlay.hide()
-            self._tray.update_status("Ready")
+        result = self._run_llm_with_watch(
+            edited_text,
+            cancel_before_message="Pipeline cancelled before LLM call (staging)",
+            cancel_during_message="Pipeline cancelled during LLM (staging)",
+            cancel_after_message="Pipeline cancelled after LLM returned (staging)",
+            error_message="Pipeline error in _process_with_staging LLM",
+        )
+        if result is None:
             return
 
-        # IMPORTANT: Check cancel again immediately after LLM returns
-        if self._cancel_requested.is_set():
-            logger.info("Pipeline cancelled after LLM returned (staging)")
-            self._hwnd_watch_active = False
-            self._overlay.hide()
-            self._tray.update_status("Ready")
-            return
-
-        # Stop watcher and verify window before injection.
+        # Stop watcher before the unified delivery step.
         self._hwnd_watch_active = False
-        if not self._verify_window_safety():
-            logger.warning(
-                "Window changed during LLM processing — holding result",
-            )
-            self._save_interaction_state(text, result, show_ghost=False)
-            self._held_result = result
-            self._held_clipboard = self._original_clipboard
-            self._overlay.fly_to_hold_bubble(result)
-            self._tray.update_status("Ready")
-            return
-
         logger.info("Injecting refined text (%d chars)", len(result))
-        inject_text(result, self._original_clipboard)
-        self._save_interaction_state(text, result)
-        self._overlay.hide()
-        self._tray.update_status("Ready")
-        logger.info("Pipeline complete")
+        if self._deliver_result(text, result):
+            logger.info("Pipeline complete")
 
     # ------------------------------------------------------------------
     # HWND watcher (Phase 2 — polls foreground window during pipeline)
@@ -922,37 +789,256 @@ class UnTypeApp:
             return True
         return not (self._window_mismatch or not verify_foreground_window(self._target_window))
 
+    def _reset_interaction_ui(
+        self,
+        *,
+        tray_status: str = "Ready",
+        hide_hold_bubble: bool = False,
+        cancel_staging: bool = False,
+    ) -> None:
+        """Reset transient UI used by an in-flight interaction."""
+        self._hwnd_watch_active = False
+        self._digit_interceptor.set_active(False)
+        self._overlay.hide()
+        self._overlay.hide_recording_personas()
+        self._overlay.hide_realtime_preview()
+        if hide_hold_bubble:
+            self._overlay.hide_hold_bubble()
+        if cancel_staging:
+            self._overlay.cancel_staging()
+        self._tray.update_status(tray_status)
+
+    def _reset_pipeline_runtime_state(self) -> None:
+        """Clear transient pipeline flags after cleanup or completion."""
+        self._hwnd_watch_active = False
+        self._digit_interceptor.set_active(False)
+        self._cancel_requested.clear()
+
+    def _save_config_snapshot(self, config: AppConfig, *, reason: str) -> None:
+        """Persist a config snapshot without mutating in-flight state."""
+        try:
+            save_config(config)
+            logger.debug("Saved configuration snapshot (%s)", reason)
+        except Exception:
+            logger.exception("Failed to save configuration snapshot (%s)", reason)
+
+    def _run_scheduled_config_save(
+        self,
+        generation: int,
+        snapshot: AppConfig,
+        *,
+        reason: str,
+    ) -> None:
+        """Persist a debounced config snapshot if it is still current."""
+        with self._config_save_lock:
+            if generation != self._config_save_generation:
+                return
+            self._config_save_timer = None
+        self._save_config_snapshot(snapshot, reason=reason)
+
+    def _schedule_config_save(self, *, delay: float, reason: str) -> None:
+        """Debounce config saves for high-frequency state changes."""
+        snapshot = copy.deepcopy(self._config)
+        with self._config_save_lock:
+            self._config_save_generation += 1
+            generation = self._config_save_generation
+            if self._config_save_timer is not None:
+                self._config_save_timer.cancel()
+            timer = threading.Timer(
+                delay,
+                self._run_scheduled_config_save,
+                args=(generation, snapshot),
+                kwargs={"reason": reason},
+            )
+            timer.name = f"untype-config-save-{generation}"
+            timer.daemon = True
+            self._config_save_timer = timer
+            timer.start()
+
+    def _save_config_now(self, *, reason: str) -> None:
+        """Cancel pending debounced writes and save the latest config immediately."""
+        snapshot = copy.deepcopy(self._config)
+        with self._config_save_lock:
+            self._config_save_generation += 1
+            if self._config_save_timer is not None:
+                self._config_save_timer.cancel()
+                self._config_save_timer = None
+        self._save_config_snapshot(snapshot, reason=reason)
+
+    def _flush_pending_config_save(self) -> None:
+        """Persist any pending debounced config update before shutdown."""
+        with self._config_save_lock:
+            if self._config_save_timer is None:
+                return
+            self._config_save_generation += 1
+            self._config_save_timer.cancel()
+            self._config_save_timer = None
+            snapshot = copy.deepcopy(self._config)
+        self._save_config_snapshot(snapshot, reason="shutdown flush")
+
+    def _call_with_timeout(
+        self,
+        func,
+        timeout: float,
+        *,
+        description: str,
+        fallback=None,
+    ):
+        """Run *func* on a worker thread with a bounded timeout."""
+        import concurrent.futures
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(func)
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            logger.warning("%s timed out", description)
+        except Exception as exc:
+            logger.warning("%s failed: %s", description, exc)
+        finally:
+            executor.shutdown(wait=False)
+
+        if fallback is not None:
+            return fallback()
+        return None
+
+    def _stop_realtime_session(self) -> str:
+        """Stop the realtime STT session and return the accumulated text."""
+        if isinstance(self._stt, STTRealtimeApiEngine):
+            return self._stt.stop_session()
+        return ""
+
+    def _cleanup_capture_resources(self) -> None:
+        """Abort active recording and stop any live realtime session."""
+        if self._recorder.is_recording:
+            logger.debug("Cleanup: aborting recorder")
+            self._recorder.abort()
+        if isinstance(self._stt, STTRealtimeApiEngine):
+            logger.debug("Cleanup: stopping STT session")
+            self._stt.stop_session()
+
+    def _cleanup_active_capture(self) -> None:
+        """Best-effort cleanup for in-flight recording/STT resources."""
+        self._call_with_timeout(
+            self._cleanup_capture_resources,
+            _CAPTURE_CLEANUP_TIMEOUT_S,
+            description="Capture cleanup",
+        )
+
+    def _get_realtime_result(self) -> str:
+        """Stop realtime STT with timeout and fall back to the current partial text."""
+        result = self._call_with_timeout(
+            self._stop_realtime_session,
+            _REALTIME_STOP_TIMEOUT_S,
+            description="STT stop_session",
+            fallback=lambda: self._stt.get_result()
+            if isinstance(self._stt, STTRealtimeApiEngine)
+            else "",
+        )
+        return result or ""
+
+    def _hold_result_for_later(
+        self,
+        raw_text: str,
+        result: str,
+        *,
+        persona: Persona | None = None,
+    ) -> None:
+        """Persist *result* for the hold bubble instead of injecting it now."""
+        self._save_interaction_state(raw_text, result, persona=persona, show_ghost=False)
+        self._held_result = result
+        self._held_clipboard = self._original_clipboard
+        self._overlay.fly_to_hold_bubble(result)
+        self._tray.update_status("Ready")
+
+    def _deliver_result(
+        self,
+        raw_text: str,
+        result: str,
+        *,
+        persona: Persona | None = None,
+    ) -> bool:
+        """Inject *result* or divert it to the hold bubble when unsafe."""
+        if not self._verify_window_safety():
+            logger.warning("Window changed before injection - holding result")
+            self._hold_result_for_later(raw_text, result, persona=persona)
+            return False
+
+        injection = inject_text(result, self._original_clipboard)
+        if not injection:
+            logger.warning(
+                "Text injection failed (clipboard=%s, paste=%s) - holding result",
+                injection.copied_to_clipboard,
+                injection.paste_simulated,
+            )
+            self._hold_result_for_later(raw_text, result, persona=persona)
+            return False
+
+        self._save_interaction_state(raw_text, result, persona=persona)
+        self._overlay.hide()
+        self._tray.update_status("Ready")
+        return True
+
     # ------------------------------------------------------------------
     # Hold callbacks (Phase 2 — called from overlay thread)
     # ------------------------------------------------------------------
 
-    def _on_hold_inject(self) -> None:
-        """Left-click on hold bubble — inject into the current foreground window."""
+    def _take_held_result(self, *, hide_bubble: bool = False) -> tuple[str | None, str | None]:
+        """Consume and clear the currently held result."""
         result = self._held_result
         clipboard = self._held_clipboard
         self._held_result = None
         self._held_clipboard = None
+        if hide_bubble:
+            self._overlay.hide_hold_bubble()
+        return result, clipboard
+
+    def _restore_held_result(
+        self,
+        result: str | None,
+        clipboard: str | None,
+        *,
+        show_bubble: bool = False,
+    ) -> None:
+        """Restore a held result after a failed retry path."""
+        self._held_result = result
+        self._held_clipboard = clipboard
+        if show_bubble and result is not None:
+            self._overlay.fly_to_hold_bubble(result)
+
+    def _try_acquire_pipeline_action(self, action_name: str) -> bool:
+        """Acquire the pipeline lock for a ghost action or log a consistent warning."""
+        if not self._pipeline_lock.acquire(blocking=False):
+            logger.warning("%s: pipeline busy — ignoring", action_name)
+            return False
+        return True
+
+    def _on_hold_inject(self) -> None:
+        """Left-click on hold bubble — inject into the current foreground window."""
+        result, clipboard = self._take_held_result()
 
         if result is None:
             return
 
         logger.info("Hold-inject: injecting %d chars into current window", len(result))
-        inject_text(result, clipboard)
+        injection = inject_text(result, clipboard)
+        if not injection:
+            logger.warning(
+                "Hold-inject failed (clipboard=%s, paste=%s) - restoring hold bubble",
+                injection.copied_to_clipboard,
+                injection.paste_simulated,
+            )
+            self._restore_held_result(result, clipboard, show_bubble=True)
+            return
 
         # Show ghost menu if we have saved interaction state.
         if self._last_raw_text is not None:
             self._last_result = result
-            caret = get_caret_screen_position()
-            self._last_caret_x = caret.x
-            self._last_caret_y = caret.y
-            self._last_target_window = get_foreground_window()
-            self._overlay.show_ghost_menu(caret.x, caret.y)
+            self._set_last_delivery_anchor(get_foreground_window(), show_ghost=True)
 
     def _on_hold_copy(self) -> None:
         """Right-click on hold bubble — copy held text to clipboard."""
-        result = self._held_result
-        self._held_result = None
-        self._held_clipboard = None
+        result, _clipboard = self._take_held_result()
 
         if result is None:
             return
@@ -969,8 +1055,7 @@ class UnTypeApp:
         Does NOT inject text.  The held result is discarded (the ghost
         menu actions will use ``_last_*`` state instead).
         """
-        self._held_result = None
-        self._held_clipboard = None
+        self._take_held_result()
 
         if self._last_raw_text is None:
             logger.warning("Hold-ghost: no interaction state saved")
@@ -1003,14 +1088,47 @@ class UnTypeApp:
         self._last_mode = self._mode
         self._last_selected_text = self._selected_text
         self._last_original_clipboard = self._original_clipboard
-        self._last_target_window = self._target_window
+        self._set_last_delivery_anchor(self._target_window, show_ghost=show_ghost)
 
+    def _set_last_delivery_anchor(
+        self,
+        target_window: WindowIdentity | None,
+        *,
+        show_ghost: bool,
+    ) -> None:
+        """Update the saved caret/window anchor for ghost actions."""
+        self._last_target_window = target_window
         caret = get_caret_screen_position()
         self._last_caret_x = caret.x
         self._last_caret_y = caret.y
-
         if show_ghost:
             self._overlay.show_ghost_menu(caret.x, caret.y)
+
+    def _restore_last_interaction_context(self, target_window: WindowIdentity | None) -> None:
+        """Restore saved interaction context before a ghost action reinjects text."""
+        self._mode = self._last_mode or "insert"
+        self._selected_text = self._last_selected_text
+        self._original_clipboard = self._last_original_clipboard
+        self._target_window = target_window
+        self._caret_x = self._last_caret_x
+        self._caret_y = self._last_caret_y
+        self._window_mismatch = False
+
+    def _undo_last_injection_if_possible(self, action_name: str) -> WindowIdentity | None:
+        """Undo the last injected result when the original target is still foreground."""
+        target = self._last_target_window
+        if target is not None and verify_foreground_window(target):
+            logger.info("%s: undoing paste via Ctrl+Z", action_name)
+            self._simulate_undo()
+        else:
+            logger.info("%s: target window not in foreground, skipping undo", action_name)
+        return target
+
+    def _get_active_persona_staging_options(self) -> list[tuple[str, str, str]] | None:
+        """Build staging persona options for the overlay when personas are active."""
+        if not self._active_personas:
+            return None
+        return [(p.id, p.icon, p.name) for p in self._active_personas]
 
     def _simulate_undo(self) -> None:
         """Send Ctrl+Z to undo the last paste in the target app."""
@@ -1035,32 +1153,12 @@ class UnTypeApp:
             logger.warning("Ghost revert: no interaction state saved")
             return
 
-        if not self._pipeline_lock.acquire(blocking=False):
-            logger.warning("Ghost revert: pipeline busy — ignoring")
+        if not self._try_acquire_pipeline_action("Ghost revert"):
             return
 
         try:
-            # Undo the paste if the target window is still in foreground.
-            target = self._last_target_window
-            if target is not None and verify_foreground_window(target):
-                logger.info("Ghost revert: undoing paste via Ctrl+Z")
-                self._simulate_undo()
-            else:
-                logger.info("Ghost revert: target window not in foreground, skipping undo")
-
-            # Restore interaction context for the staging area.
-            self._mode = self._last_mode or "insert"
-            self._selected_text = self._last_selected_text
-            self._original_clipboard = self._last_original_clipboard
-            self._target_window = target
-            self._caret_x = self._last_caret_x
-            self._caret_y = self._last_caret_y
-            self._window_mismatch = False
-
-            # Build persona list for staging (if available).
-            personas_arg = None
-            if self._active_personas:
-                personas_arg = [(p.id, p.icon, p.name) for p in self._active_personas]
+            target = self._undo_last_injection_if_possible("Ghost revert")
+            self._restore_last_interaction_context(target)
 
             # Clear last state before re-entering staging.
             self._last_raw_text = None
@@ -1071,7 +1169,7 @@ class UnTypeApp:
                 raw_text,
                 self._caret_x,
                 self._caret_y,
-                personas=personas_arg,
+                personas=self._get_active_persona_staging_options(),
             )
 
             # Block until user acts.
@@ -1094,56 +1192,28 @@ class UnTypeApp:
 
             if action == "raw":
                 logger.info("Ghost revert: injecting raw text (%d chars)", len(edited_text))
-                inject_text(edited_text, self._original_clipboard)
-                self._save_interaction_state(raw_text, edited_text)
+                self._deliver_result(raw_text, edited_text)
                 return
 
-            # action == "refine"
-            self._overlay.show(self._caret_x, self._caret_y, "Processing...")
-            self._tray.update_status("Processing...")
-
-            # Start HWND monitoring during LLM call.
-            self._start_hwnd_watcher()
-
-            try:
-                result = self._run_llm(edited_text, persona=persona)
-            except KeyboardInterrupt:
-                # LLM request was cancelled by user
-                logger.info("Ghost revert: LLM cancelled by user")
-                self._hwnd_watch_active = False
-                self._overlay.hide()
-                self._tray.update_status("Ready")
+            result = self._run_llm_with_watch(
+                edited_text,
+                persona=persona,
+                cancel_before_message="Ghost revert: cancelled before LLM call",
+                cancel_during_message="Ghost revert: LLM cancelled by user",
+                cancel_after_message="Ghost revert: cancelled after LLM returned",
+                error_message="Ghost revert LLM error",
+            )
+            if result is None:
                 return
 
-            # Stop watcher and verify window before injection.
+            # Stop watcher before the unified delivery step.
             self._hwnd_watch_active = False
-            if not self._verify_window_safety():
-                logger.warning(
-                    "Ghost revert: window changed during LLM — holding result",
-                )
-                self._save_interaction_state(
-                    raw_text,
-                    result,
-                    persona=persona,
-                    show_ghost=False,
-                )
-                self._held_result = result
-                self._held_clipboard = self._original_clipboard
-                self._overlay.fly_to_hold_bubble(result)
-                self._tray.update_status("Ready")
-                return
-
             logger.info("Ghost revert: injecting refined text (%d chars)", len(result))
-            inject_text(result, self._original_clipboard)
-            self._save_interaction_state(raw_text, result, persona=persona)
-            self._overlay.hide()
-            self._tray.update_status("Ready")
+            self._deliver_result(raw_text, result, persona=persona)
 
         except Exception:
             logger.exception("Ghost revert error")
-            self._hwnd_watch_active = False
-            self._overlay.hide()
-            self._tray.update_status("Ready")
+            self._reset_interaction_ui()
         finally:
             self._hwnd_watch_active = False
             self._pipeline_lock.release()
@@ -1156,74 +1226,32 @@ class UnTypeApp:
             logger.warning("Ghost regenerate: no interaction state saved")
             return
 
-        if not self._pipeline_lock.acquire(blocking=False):
-            logger.warning("Ghost regenerate: pipeline busy — ignoring")
+        if not self._try_acquire_pipeline_action("Ghost regenerate"):
             return
 
         try:
-            # Undo the paste if the target window is still in foreground.
-            target = self._last_target_window
-            if target is not None and verify_foreground_window(target):
-                logger.info("Ghost regenerate: undoing paste via Ctrl+Z")
-                self._simulate_undo()
-            else:
-                logger.info("Ghost regenerate: target window not in foreground, skipping undo")
+            target = self._undo_last_injection_if_possible("Ghost regenerate")
+            self._restore_last_interaction_context(target)
 
-            # Restore interaction context.
-            self._mode = self._last_mode or "insert"
-            self._selected_text = self._last_selected_text
-            self._original_clipboard = self._last_original_clipboard
-            self._target_window = target
-            self._caret_x = self._last_caret_x
-            self._caret_y = self._last_caret_y
-            self._window_mismatch = False
-
-            # Show capsule with processing status.
-            self._overlay.show(self._caret_x, self._caret_y, "Processing...")
-            self._tray.update_status("Processing...")
-
-            # Start HWND monitoring during LLM call.
-            self._start_hwnd_watcher()
-
-            try:
-                result = self._run_llm(raw_text, persona=persona)
-            except KeyboardInterrupt:
-                # LLM request was cancelled by user
-                logger.info("Ghost regenerate: LLM cancelled by user")
-                self._hwnd_watch_active = False
-                self._overlay.hide()
-                self._tray.update_status("Ready")
+            result = self._run_llm_with_watch(
+                raw_text,
+                persona=persona,
+                cancel_before_message="Ghost regenerate: cancelled before LLM call",
+                cancel_during_message="Ghost regenerate: LLM cancelled by user",
+                cancel_after_message="Ghost regenerate: cancelled after LLM returned",
+                error_message="Ghost regenerate LLM error",
+            )
+            if result is None:
                 return
 
-            # Stop watcher and verify window before injection.
+            # Stop watcher before the unified delivery step.
             self._hwnd_watch_active = False
-            if not self._verify_window_safety():
-                logger.warning(
-                    "Ghost regenerate: window changed during LLM — holding result",
-                )
-                self._save_interaction_state(
-                    raw_text,
-                    result,
-                    persona=persona,
-                    show_ghost=False,
-                )
-                self._held_result = result
-                self._held_clipboard = self._original_clipboard
-                self._overlay.fly_to_hold_bubble(result)
-                self._tray.update_status("Ready")
-                return
-
             logger.info("Ghost regenerate: injecting refined text (%d chars)", len(result))
-            inject_text(result, self._original_clipboard)
-            self._save_interaction_state(raw_text, result, persona=persona)
-            self._overlay.hide()
-            self._tray.update_status("Ready")
+            self._deliver_result(raw_text, result, persona=persona)
 
         except Exception:
             logger.exception("Ghost regenerate error")
-            self._hwnd_watch_active = False
-            self._overlay.hide()
-            self._tray.update_status("Ready")
+            self._reset_interaction_ui()
         finally:
             self._hwnd_watch_active = False
             self._pipeline_lock.release()
@@ -1235,26 +1263,15 @@ class UnTypeApp:
             logger.warning("Ghost use-raw: no interaction state saved")
             return
 
-        if not self._pipeline_lock.acquire(blocking=False):
-            logger.warning("Ghost use-raw: pipeline busy — ignoring")
+        if not self._try_acquire_pipeline_action("Ghost use-raw"):
             return
 
         try:
-            # Undo the paste if the target window is still in foreground.
-            target = self._last_target_window
-            if target is not None and verify_foreground_window(target):
-                logger.info("Ghost use-raw: undoing paste via Ctrl+Z")
-                self._simulate_undo()
-            else:
-                logger.info("Ghost use-raw: target window not in foreground, skipping undo")
-
-            # Restore context.
-            self._original_clipboard = self._last_original_clipboard
-            self._target_window = target
+            target = self._undo_last_injection_if_possible("Ghost use-raw")
+            self._restore_last_interaction_context(target)
 
             logger.info("Ghost use-raw: injecting raw text (%d chars)", len(raw_text))
-            inject_text(raw_text, self._original_clipboard)
-            self._save_interaction_state(raw_text, raw_text)
+            self._deliver_result(raw_text, raw_text)
 
         except Exception:
             logger.exception("Ghost use-raw error")
@@ -1282,20 +1299,15 @@ class UnTypeApp:
 
     def _save_selected_persona(self, persona_id: str | None) -> None:
         """Save the selected persona ID to config."""
-        from untype.config import save_config
-
         # Save "default" as empty string (the actual default)
         if persona_id == "default":
             persona_id = None
 
         self._config.last_selected_persona = persona_id or "default"
-        # Spawn a thread to save config without blocking
-        threading.Thread(
-            target=save_config,
-            args=(self._config,),
-            name="untype-save-persona",
-            daemon=True,
-        ).start()
+        self._schedule_config_save(
+            delay=_CONFIG_SAVE_DEBOUNCE_S,
+            reason="persona selection",
+        )
 
     def _on_rec_persona_click(self, index: int) -> None:
         """Called from overlay thread when a recording persona button is clicked."""
@@ -1312,7 +1324,7 @@ class UnTypeApp:
         self._prev_config = copy.deepcopy(new_config)
 
         logger.info("Saving updated configuration...")
-        save_config(new_config)
+        self._save_config_now(reason="settings update")
 
         # --- Language ---
         if new_config.language != old.language:
@@ -1435,12 +1447,11 @@ class UnTypeApp:
         """Handle capsule position change from drag (fixed mode)."""
         self._config.overlay.capsule_fixed_x = x
         self._config.overlay.capsule_fixed_y = y
-        # Save to config file
-        try:
-            save_config(self._config)
-            logger.debug("Saved capsule position: %d, %d", x, y)
-        except Exception:
-            logger.exception("Failed to save capsule position")
+        logger.debug("Queueing capsule position save: %d, %d", x, y)
+        self._schedule_config_save(
+            delay=_CONFIG_SAVE_DEBOUNCE_S,
+            reason="capsule position",
+        )
 
     # ------------------------------------------------------------------
     # Quit
@@ -1449,6 +1460,7 @@ class UnTypeApp:
     def _on_quit(self) -> None:
         """Handle the Quit action from the tray menu."""
         logger.info("Shutting down...")
+        self._flush_pending_config_save()
         self._hotkey.stop()
         self._digit_interceptor.stop()
         self._overlay.stop()

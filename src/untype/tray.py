@@ -101,7 +101,12 @@ class SettingsDialog:
     thread — **never** from the pystray callback thread directly.
     """
 
-    def __init__(self, config: AppConfig, on_save: Callable[[AppConfig], None], on_rerun_wizard: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        on_save: Callable[[AppConfig], None],
+        on_rerun_wizard: Callable[[], None] | None = None,
+    ) -> None:
         """
         Args:
             config: Current app configuration.
@@ -233,8 +238,12 @@ class SettingsDialog:
             if backend == "local" and not HAS_LOCAL_STT:
                 import tkinter.messagebox as messagebox
                 messagebox.showinfo(
-                    t("settings.backend.local") if hasattr(t, "_dict") else "Local Model",
-                    t("tooltip.local_stt_disabled") if hasattr(t, "_dict") else "Local speech recognition requires the full version.\n\nPlease download UnType-v0.3.0-full.zip from GitHub releases."
+                    t("settings.backend.local", "Local Model"),
+                    t(
+                        "tooltip.local_stt_disabled",
+                        "Local speech recognition requires the full version.\n\n"
+                        "Please download UnType-v0.3.0-full.zip from GitHub releases.",
+                    ),
                 )
                 # Reset to api
                 stt_backend_var.set("api")
@@ -740,11 +749,7 @@ class SettingsDialog:
                 if hotkey.lower() in SettingsDialog._BLOCKED_HOTKEYS:
                     import tkinter.messagebox as messagebox
 
-                    title = (
-                        t("settings.error.invalid_hotkey")
-                        if hasattr(t, "_dict") and "settings.error.invalid_hotkey" in t._dict
-                        else "Invalid Hotkey"
-                    )  # noqa: E501
+                    title = t("settings.error.invalid_hotkey", "Invalid Hotkey")
                     msg = (
                         f"{hotkey} cannot be used as it conflicts with "
                         "system or application functions.\n\n"
@@ -1052,16 +1057,11 @@ class TrayApp:
 
             title_key = "settings.error.recording_title"
             msg_key = "settings.error.recording_message"
-            title = (
-                t(title_key)
-                if hasattr(t, "_dict") and title_key in t._dict
-                else "Recording in Progress"
-            )
-            message = (
-                t(msg_key)
-                if hasattr(t, "_dict") and msg_key in t._dict
-                else "Cannot open settings while recording. "
-                "Please finish or cancel the recording first."
+            title = t(title_key, "Recording in Progress")
+            message = t(
+                msg_key,
+                "Cannot open settings while recording. "
+                "Please finish or cancel the recording first.",
             )
             messagebox.showwarning(title, message)
             root.destroy()

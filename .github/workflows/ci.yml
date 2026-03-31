@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --extra dev --extra test
+
+      - name: Lint
+        run: >-
+          .\.venv\Scripts\python.exe -m ruff check
+          build.py
+          src\untype\build_info.py
+          src\untype\clipboard.py
+          src\untype\config.py
+          src\untype\hotkey.py
+          src\untype\i18n.py
+          src\untype\llm.py
+          src\untype\stt.py
+          src\untype\tray.py
+          tests
+
+      - name: Compile core runtime files
+        run: >-
+          .\.venv\Scripts\python.exe -m py_compile
+          src\untype\main.py
+          src\untype\overlay.py
+          src\untype\clipboard.py
+          src\untype\stt.py
+
+      - name: Run tests
+        run: .\.venv\Scripts\python.exe -m pytest

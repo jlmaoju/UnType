@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 
 import pyperclip
 from pynput.keyboard import Controller, Key
@@ -13,6 +14,34 @@ from untype.platform import get_modifier_key
 logger = logging.getLogger(__name__)
 
 _keyboard = Controller()
+
+_CLIPBOARD_RETRY_COUNT = 2
+_CLIPBOARD_RETRY_DELAY_S = 0.05
+_SELECTION_POLL_COUNT = 5
+_SELECTION_POLL_DELAY_S = 0.03
+_SELECTION_COPY_SETTLE_S = 0.03
+_PASTE_SETTLE_S = 0.1
+_HOTKEY_ATTEMPTS = 2
+_HOTKEY_RETRY_DELAY_S = 0.03
+_MODIFIER_RELEASE_DELAY_S = 0.05
+_HOTKEY_MODIFIER_PRESS_DELAY_S = 0.05
+_HOTKEY_KEY_PRESS_DELAY_S = 0.02
+
+
+@dataclass(frozen=True)
+class InjectionResult:
+    """Outcome of a clipboard-based text injection attempt."""
+
+    copied_to_clipboard: bool
+    paste_simulated: bool
+
+    @property
+    def delivered(self) -> bool:
+        """Whether the app completed both clipboard copy and paste simulation."""
+        return self.copied_to_clipboard and self.paste_simulated
+
+    def __bool__(self) -> bool:
+        return self.delivered
 
 
 def save_clipboard() -> str | None:
@@ -25,13 +54,8 @@ def save_clipboard() -> str | None:
 
 def restore_clipboard(content: str | None) -> None:
     """Restore clipboard to previous content after a short delay."""
-    time.sleep(0.05)
-    try:
-        if content is None:
-            pyperclip.copy("")
-        else:
-            pyperclip.copy(content)
-    except pyperclip.PyperclipException:
+    time.sleep(_CLIPBOARD_RETRY_DELAY_S)
+    if not _copy_to_clipboard(content):
         pass
 
 
@@ -45,57 +69,94 @@ def grab_selected_text() -> tuple[str | None, str | None]:
     original = save_clipboard()
 
     # Clear the clipboard so we can detect whether Ctrl+C wrote anything new.
-    try:
-        pyperclip.copy("")
-    except pyperclip.PyperclipException:
+    if not _copy_to_clipboard(""):
         return None, original
 
     # Simulate Ctrl+C to copy the current selection.
-    _simulate_hotkey(get_modifier_key(), "c")
-    time.sleep(0.15)
-
-    # Read whatever ended up on the clipboard.
-    try:
-        text = pyperclip.paste()
-    except pyperclip.PyperclipException:
+    if not _simulate_hotkey_with_retry(get_modifier_key(), "c"):
+        restore_clipboard(original)
         return None, original
+    time.sleep(_SELECTION_COPY_SETTLE_S)
 
-    if text:
-        return text, original
+    # Poll for the new clipboard contents instead of relying on a single fixed delay.
+    for _ in range(_SELECTION_POLL_COUNT):
+        try:
+            text = pyperclip.paste()
+        except pyperclip.PyperclipException:
+            text = ""
+        if text:
+            return text, original
+        time.sleep(_SELECTION_POLL_DELAY_S)
     return None, original
 
 
-def inject_text(text: str, original_clipboard: str | None) -> bool:
+def inject_text(text: str, original_clipboard: str | None) -> InjectionResult:
     """Inject *text* at the current cursor position via Ctrl+V.
 
     After pasting, the original clipboard content is restored so the user's
     clipboard is not clobbered.
 
     Returns:
-        True if the text was successfully copied to clipboard (does not
-        verify actual paste success). The original clipboard is always
-        restored regardless of the result.
+        An :class:`InjectionResult` describing whether the text was copied to
+        the clipboard and whether the paste hotkey was successfully simulated.
+        The original clipboard is always restored regardless of the result.
     """
-    injection_succeeded = False
+    copied_to_clipboard = False
+    paste_simulated = False
 
-    try:
-        pyperclip.copy(text)
-        injection_succeeded = True
-    except pyperclip.PyperclipException as e:
-        logger.warning("Failed to copy text to clipboard: %s", e)
+    copied_to_clipboard = _copy_to_clipboard(text)
 
-    if injection_succeeded:
-        try:
-            time.sleep(0.05)
-            _simulate_hotkey(get_modifier_key(), "v")
-            time.sleep(0.1)
-        except Exception as e:
-            logger.warning("Failed to simulate Ctrl+V: %s", e)
+    if copied_to_clipboard:
+        paste_simulated = _simulate_hotkey_with_retry(get_modifier_key(), "v")
+        if paste_simulated:
+            time.sleep(_PASTE_SETTLE_S)
 
     # Always restore the original clipboard, regardless of injection success
     restore_clipboard(original_clipboard)
 
-    return injection_succeeded
+    return InjectionResult(
+        copied_to_clipboard=copied_to_clipboard,
+        paste_simulated=paste_simulated,
+    )
+
+
+def _copy_to_clipboard(content: str | None) -> bool:
+    """Best-effort clipboard copy with a couple of short retries."""
+    clipboard_text = "" if content is None else content
+    for attempt in range(1, _CLIPBOARD_RETRY_COUNT + 1):
+        try:
+            pyperclip.copy(clipboard_text)
+            return True
+        except pyperclip.PyperclipException as exc:
+            logger.warning(
+                "Failed to copy text to clipboard (attempt %d/%d): %s",
+                attempt,
+                _CLIPBOARD_RETRY_COUNT,
+                exc,
+            )
+            if attempt < _CLIPBOARD_RETRY_COUNT:
+                time.sleep(_CLIPBOARD_RETRY_DELAY_S)
+    return False
+
+
+def _simulate_hotkey_with_retry(key: Key, char: str) -> bool:
+    """Best-effort hotkey simulation with a very small bounded retry budget."""
+    for attempt in range(1, _HOTKEY_ATTEMPTS + 1):
+        try:
+            _simulate_hotkey(key, char)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Failed to simulate %s+%s (attempt %d/%d): %s",
+                key,
+                char,
+                attempt,
+                _HOTKEY_ATTEMPTS,
+                exc,
+            )
+            if attempt < _HOTKEY_ATTEMPTS:
+                time.sleep(_HOTKEY_RETRY_DELAY_S)
+    return False
 
 
 def _simulate_hotkey(key: Key, char: str) -> None:
@@ -107,13 +168,13 @@ def _simulate_hotkey(key: Key, char: str) -> None:
     """
     # Release any modifiers the user might still be holding from the hotkey
     _release_all_modifiers()
-    time.sleep(0.05)
+    time.sleep(_MODIFIER_RELEASE_DELAY_S)
     _keyboard.press(key)
-    time.sleep(0.05)
+    time.sleep(_HOTKEY_MODIFIER_PRESS_DELAY_S)
     _keyboard.press(char)
-    time.sleep(0.02)
+    time.sleep(_HOTKEY_KEY_PRESS_DELAY_S)
     _keyboard.release(char)
-    time.sleep(0.02)
+    time.sleep(_HOTKEY_KEY_PRESS_DELAY_S)
     _keyboard.release(key)
 
 

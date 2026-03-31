@@ -87,7 +87,7 @@ uv run untype
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) (recommended package manager)
 - A working microphone
-- An OpenAI-compatible STT API key (for online mode), or a GPU for local Whisper inference
+- An Aliyun DashScope API key (default realtime mode), or an OpenAI-compatible STT API key (for `api` mode), or a GPU for local Whisper inference
 - An OpenAI-compatible LLM API key (for text refinement; optional but recommended)
 
 ## Configuration
@@ -104,7 +104,13 @@ Settings are stored in `~/.untype/config.toml` (created on first launch):
 
 ### STT Backend Selection
 
-**Online API (default)**
+**Aliyun Realtime API (default, recommended)**
+- Uses Aliyun DashScope realtime speech recognition
+- **WebSocket streaming with live transcription preview during recording**
+- **Ultra-low latency, experience similar to WeChat voice input**
+- Requires [Aliyun DashScope API Key](https://dashscope.console.aliyun.com/)
+
+**OpenAI-compatible API**
 - Uses OpenAI-compatible `/audio/transcriptions` interface
 - Works with any proxy service
 - Returns complete result after recording ends
@@ -113,12 +119,6 @@ Settings are stored in `~/.untype/config.toml` (created on first launch):
 - Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) for local inference
 - Requires GPU with CUDA support
 - Better privacy, no internet needed
-
-**Aliyun Realtime API (recommended)**
-- Uses Aliyun DashScope realtime speech recognition
-- **WebSocket streaming with live transcription preview during recording**
-- **Ultra-low latency, experience similar to WeChat voice input**
-- Requires [Aliyun DashScope API Key](https://dashscope.console.aliyun.com/)
 
 ## How It Works
 
@@ -154,6 +154,9 @@ uv run ruff check src/      # Lint
 uv run ruff format src/      # Format
 uv run pytest                # Run tests
 ```
+
+The repository also includes a GitHub Actions CI workflow for Windows that
+runs lint and tests on Python 3.11 and 3.13.
 
 ## License
 
