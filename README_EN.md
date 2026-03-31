@@ -164,6 +164,15 @@ This project is licensed under the [GNU General Public License v3.0](LICENSE).
 
 ## Changelog
 
+### v0.4.0 (2026-03-31)
+- **Add Recent Results panel** - Access the latest voice results from the tray and quickly copy, re-inject, or reopen them in the editor
+- **Simplify persona selection during recording** - Support quick personas so the recording bar focuses on a few high-frequency choices instead of the full list
+- **Restore key preferences correctly** - Language and last selected persona are now loaded back from config on startup
+- **Improve hotkey recording for punctuation and keypad keys** - Prevent spurious `Alt` capture and accept aliases such as keypad minus
+- **Switch text output to typed injection** - Output is now typed character-by-character instead of pasted from the clipboard
+- **Harden runtime delivery logic** - Better handling for realtime STT startup failures, delivery fallbacks, ghost actions, and configuration save debounce
+- **Expand regression coverage** - Add tests for build, config, hotkey, i18n, LLM, clipboard, overlay, and main runtime helpers
+
 ### v0.3.0 (2025-02-28)
 - **Add first-run setup wizard** — Guided configuration for new users, with STT/LLM API setup and connection testing
 - **Add persona activation feature** — Select personas to activate during wizard; enable/disable in persona manager

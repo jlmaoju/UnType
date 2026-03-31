@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw
 from untype.build_info import HAS_LOCAL_STT
 from untype.config import AppConfig, save_config
 from untype.i18n import get_locale_display_name, list_available_locales, t
+from untype.recent_results import RecentResultEntry
 
 logger = logging.getLogger(__name__)
 
@@ -665,26 +666,15 @@ class SettingsDialog:
         warning_label.grid(row=row + 1, column=1, sticky="w", pady=(0, 2))
 
         # Track recording state
-        recording_state = {"active": False}
+        recording_state = {
+            "active": False,
+            "held_modifiers": set(),
+        }
 
         def format_key_event(event: tk.Event) -> str:  # type: ignore[type-arg]
             """Convert a key event to a hotkey string."""
-            # Build modifiers
-            mods = []
-            if event.state & 0x0001:  # Shift
-                mods.append("shift")
-            if event.state & 0x0002:  # Caps Lock (ignore)
-                pass
-            if event.state & 0x0004:  # Control
-                mods.append("ctrl")
-            if event.state & 0x0008:  # Alt
-                mods.append("alt")
-
-            # Get the key name
             keysym = event.keysym.lower()
-
-            # Normalize key names
-            key_map = {
+            modifier_map = {
                 "control_l": "ctrl",
                 "control_r": "ctrl",
                 "shift_l": "shift",
@@ -695,6 +685,18 @@ class SettingsDialog:
                 "win_r": "win",
                 "super_l": "win",
                 "super_r": "win",
+            }
+            if keysym in modifier_map:
+                return ""
+
+            mods = [
+                name
+                for name in ("ctrl", "alt", "shift", "win")
+                if name in recording_state["held_modifiers"]
+            ]
+
+            # Normalize key names
+            key_map = {
                 "space": "space",
                 "return": "enter",
                 "escape": "esc",
@@ -706,26 +708,32 @@ class SettingsDialog:
                 "end": "end",
                 "insert": "insert",
                 "delete": "delete",
+                "minus": "-",
+                "subtract": "-",
+                "kp_subtract": "-",
+                "equal": "=",
+                "comma": ",",
+                "period": ".",
+                "slash": "/",
+                "backslash": "\\",
+                "semicolon": ";",
+                "apostrophe": "'",
+                "grave": "`",
+                "bracketleft": "[",
+                "bracketright": "]",
             }
 
-            # Skip modifier-only presses
-            if keysym in (
-                "shift_l",
-                "shift_r",
-                "control_l",
-                "control_r",
-                "alt_l",
-                "alt_r",
-                "win_l",
-                "win_r",
-            ):
-                return ""
-
-            key = key_map.get(keysym, keysym)
+            key = key_map.get(keysym)
 
             # Handle function keys
             if keysym.startswith("f") and keysym[1:].isdigit():
                 key = keysym
+            elif key is None:
+                char = getattr(event, "char", "") or ""
+                if char and char.isprintable():
+                    key = char.lower()
+                else:
+                    key = keysym
 
             # Build final string
             if mods:
@@ -734,15 +742,34 @@ class SettingsDialog:
 
         def on_focus_in(_event: tk.Event) -> None:  # type: ignore[type-arg]
             recording_state["active"] = True
+            recording_state["held_modifiers"].clear()
             entry.configure(style="Recording.TEntry")
 
         def on_focus_out(_event: tk.Event) -> None:  # type: ignore[type-arg]
             recording_state["active"] = False
+            recording_state["held_modifiers"].clear()
             entry.configure(style="TEntry")
 
         def on_key_press(event: tk.Event) -> str:  # type: ignore[type-arg]
             if not recording_state["active"]:
                 return ""
+            keysym = event.keysym.lower()
+            modifier_map = {
+                "control_l": "ctrl",
+                "control_r": "ctrl",
+                "shift_l": "shift",
+                "shift_r": "shift",
+                "alt_l": "alt",
+                "alt_r": "alt",
+                "win_l": "win",
+                "win_r": "win",
+                "super_l": "win",
+                "super_r": "win",
+            }
+            modifier = modifier_map.get(keysym)
+            if modifier is not None:
+                recording_state["held_modifiers"].add(modifier)
+                return "break"
             hotkey = format_key_event(event)
             if hotkey:
                 # Check if hotkey is blocked
@@ -761,6 +788,25 @@ class SettingsDialog:
                 warning_var.set("")
             return "break"  # Prevent default handling
 
+        def on_key_release(event: tk.Event) -> str:  # type: ignore[type-arg]
+            keysym = event.keysym.lower()
+            modifier_map = {
+                "control_l": "ctrl",
+                "control_r": "ctrl",
+                "shift_l": "shift",
+                "shift_r": "shift",
+                "alt_l": "alt",
+                "alt_r": "alt",
+                "win_l": "win",
+                "win_r": "win",
+                "super_l": "win",
+                "super_r": "win",
+            }
+            modifier = modifier_map.get(keysym)
+            if modifier is not None:
+                recording_state["held_modifiers"].discard(modifier)
+            return "break"
+
         # Create style for recording state
         style = ttk.Style()
         style.configure("Recording.TEntry", fieldbackground="#e6f3ff")
@@ -768,6 +814,7 @@ class SettingsDialog:
         entry.bind("<FocusIn>", on_focus_in)
         entry.bind("<FocusOut>", on_focus_out)
         entry.bind("<KeyPress>", on_key_press)
+        entry.bind("<KeyRelease>", on_key_release)
 
         # Add hint text
         hint = ttk.Label(
@@ -912,6 +959,238 @@ class SettingsDialog:
 
 
 # ---------------------------------------------------------------------------
+# Recent results dialog
+# ---------------------------------------------------------------------------
+
+
+class RecentResultsDialog:
+    """Lightweight tkinter dialog for browsing recent results."""
+
+    def __init__(
+        self,
+        get_entries: Callable[[], list[RecentResultEntry]],
+        on_copy: Callable[[str], bool] | None,
+        on_inject: Callable[[str], bool] | None,
+        on_edit: Callable[[str], bool] | None,
+    ) -> None:
+        self._get_entries = get_entries
+        self._on_copy = on_copy
+        self._on_inject = on_inject
+        self._on_edit = on_edit
+        self._entries: list[RecentResultEntry] = []
+        self._root: tk.Tk | None = None
+
+    def show(self) -> None:
+        root = tk.Tk()
+        root.title(t("tray.recent.title", default="Recent Results"))
+        root.resizable(True, True)
+        root.minsize(760, 420)
+        root.attributes("-topmost", True)
+        root.after(100, lambda: root.attributes("-topmost", False))
+        root.protocol("WM_DELETE_WINDOW", root.destroy)
+        self._root = root
+
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
+
+        outer = ttk.Frame(root, padding=12)
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.columnconfigure(0, weight=0)
+        outer.columnconfigure(1, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        list_frame = ttk.LabelFrame(
+            outer,
+            text=t("tray.recent.list", default="Results"),
+            padding=6,
+        )
+        list_frame.grid(row=0, column=0, sticky="ns", padx=(0, 8))
+        list_frame.rowconfigure(0, weight=1)
+
+        self._listbox = tk.Listbox(list_frame, width=36, exportselection=False)
+        self._listbox.grid(row=0, column=0, sticky="nsew")
+        self._listbox.bind("<<ListboxSelect>>", self._on_list_select)
+
+        list_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self._listbox.yview)
+        list_scroll.grid(row=0, column=1, sticky="ns")
+        self._listbox.configure(yscrollcommand=list_scroll.set)
+
+        detail_frame = ttk.LabelFrame(
+            outer,
+            text=t("tray.recent.detail", default="Details"),
+            padding=8,
+        )
+        detail_frame.grid(row=0, column=1, sticky="nsew")
+        detail_frame.columnconfigure(0, weight=1)
+        detail_frame.rowconfigure(1, weight=1)
+
+        self._meta_var = tk.StringVar(master=root)
+        ttk.Label(
+            detail_frame,
+            textvariable=self._meta_var,
+            justify="left",
+            wraplength=420,
+        ).grid(row=0, column=0, sticky="ew")
+
+        self._preview = tk.Text(
+            detail_frame,
+            height=12,
+            wrap="word",
+            bg="#222222",
+            fg="#f2f2f2",
+            insertbackground="#f2f2f2",
+            relief="flat",
+            padx=10,
+            pady=10,
+        )
+        self._preview.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        self._preview.configure(state="disabled")
+
+        self._status_var = tk.StringVar(master=root)
+        ttk.Label(
+            detail_frame,
+            textvariable=self._status_var,
+            foreground="#666666",
+            wraplength=420,
+        ).grid(row=2, column=0, sticky="ew", pady=(8, 0))
+
+        button_frame = ttk.Frame(outer)
+        button_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
+        self._inject_btn = ttk.Button(
+            button_frame,
+            text=t("tray.recent.inject", default="Inject"),
+            command=self._on_inject_clicked,
+        )
+        self._inject_btn.pack(side="left")
+
+        self._copy_btn = ttk.Button(
+            button_frame,
+            text=t("tray.recent.copy", default="Copy"),
+            command=self._on_copy_clicked,
+        )
+        self._copy_btn.pack(side="left", padx=(6, 0))
+
+        self._edit_btn = ttk.Button(
+            button_frame,
+            text=t("tray.recent.edit", default="Open Editor"),
+            command=self._on_edit_clicked,
+        )
+        self._edit_btn.pack(side="left", padx=(6, 0))
+
+        ttk.Button(
+            button_frame,
+            text=t("tray.recent.refresh", default="Refresh"),
+            command=self._refresh_entries,
+        ).pack(side="right")
+
+        ttk.Button(
+            button_frame,
+            text=t("settings.cancel", default="Close"),
+            command=root.destroy,
+        ).pack(side="right", padx=(0, 6))
+
+        self._refresh_entries()
+
+        root.update_idletasks()
+        width, height = root.winfo_width(), root.winfo_height()
+        x = (root.winfo_screenwidth() - width) // 2
+        y = (root.winfo_screenheight() - height) // 2
+        root.geometry(f"+{x}+{y}")
+        root.mainloop()
+
+    def _selected_entry(self) -> RecentResultEntry | None:
+        selection = self._listbox.curselection()
+        if not selection:
+            return None
+        index = selection[0]
+        if index < 0 or index >= len(self._entries):
+            return None
+        return self._entries[index]
+
+    def _status_text(self, status: str) -> str:
+        return t(f"tray.recent.status.{status}", default=status.capitalize())
+
+    def _set_preview_text(self, text: str) -> None:
+        self._preview.configure(state="normal")
+        self._preview.delete("1.0", "end")
+        self._preview.insert("1.0", text)
+        self._preview.configure(state="disabled")
+
+    def _update_detail(self) -> None:
+        entry = self._selected_entry()
+        if entry is None:
+            self._meta_var.set(t("tray.recent.empty", default="No recent results yet."))
+            self._set_preview_text("")
+            self._inject_btn.state(["disabled"])
+            self._copy_btn.state(["disabled"])
+            self._edit_btn.state(["disabled"])
+            return
+
+        mode_label = t(f"tray.recent.mode.{entry.mode}", default=entry.mode.capitalize())
+        window_title = entry.window_title or t("tray.recent.window.unknown", default="Unknown")
+        meta_lines = [
+            f"{t('tray.recent.time', default='Time')}: {entry.timestamp_label}",
+            f"{t('tray.recent.mode', default='Mode')}: {mode_label}",
+            f"{t('tray.recent.persona', default='Persona')}: {entry.persona_label}",
+            f"{t('tray.recent.window', default='Window')}: {window_title}",
+            f"{t('tray.recent.status', default='Status')}: {self._status_text(entry.status)}",
+        ]
+        self._meta_var.set("\n".join(meta_lines))
+        self._set_preview_text(entry.result_text)
+        self._inject_btn.state(["!disabled"])
+        self._copy_btn.state(["!disabled"])
+        self._edit_btn.state(["!disabled"])
+
+    def _refresh_entries(self) -> None:
+        self._entries = self._get_entries()
+        self._listbox.delete(0, "end")
+        for entry in self._entries:
+            line = (
+                f"{entry.timestamp_label}  "
+                f"[{self._status_text(entry.status)}]  "
+                f"{entry.preview_text}"
+            )
+            self._listbox.insert("end", line)
+
+        if self._entries:
+            self._listbox.selection_set(0)
+            self._listbox.see(0)
+            self._status_var.set("")
+        else:
+            self._status_var.set(t("tray.recent.empty", default="No recent results yet."))
+        self._update_detail()
+
+    def _on_list_select(self, _event: tk.Event) -> None:  # type: ignore[type-arg]
+        self._update_detail()
+
+    def _on_copy_clicked(self) -> None:
+        entry = self._selected_entry()
+        if entry is None or self._on_copy is None:
+            return
+        if self._on_copy(entry.id):
+            self._status_var.set(t("tray.recent.feedback.copied", default="Copied to clipboard."))
+            self._refresh_entries()
+        else:
+            self._status_var.set(t("tray.recent.feedback.failed", default="Action failed."))
+
+    def _close_then_run(self, callback: Callable[[str], bool] | None) -> None:
+        entry = self._selected_entry()
+        root = self._root
+        if entry is None or callback is None or root is None:
+            return
+        root.update_idletasks()
+        root.destroy()
+        callback(entry.id)
+
+    def _on_inject_clicked(self) -> None:
+        self._close_then_run(self._on_inject)
+
+    def _on_edit_clicked(self) -> None:
+        self._close_then_run(self._on_edit)
+
+
+# ---------------------------------------------------------------------------
 # System tray application
 # ---------------------------------------------------------------------------
 
@@ -932,6 +1211,10 @@ class TrayApp:
         on_personas_changed: Callable[[], None] | None = None,
         is_recording: Callable[[], bool] | None = None,
         on_rerun_wizard: Callable[[], None] | None = None,
+        get_recent_results: Callable[[], list[RecentResultEntry]] | None = None,
+        on_recent_copy: Callable[[str], bool] | None = None,
+        on_recent_inject: Callable[[str], bool] | None = None,
+        on_recent_edit: Callable[[str], bool] | None = None,
     ) -> None:
         self._config = config
         self._on_settings_changed = on_settings_changed
@@ -939,6 +1222,10 @@ class TrayApp:
         self._on_personas_changed_cb = on_personas_changed
         self._is_recording = is_recording
         self._on_rerun_wizard = on_rerun_wizard
+        self._get_recent_results = get_recent_results
+        self._on_recent_copy = on_recent_copy
+        self._on_recent_inject = on_recent_inject
+        self._on_recent_edit = on_recent_edit
         self._status: str = "Ready"
         self._icon: pystray.Icon | None = None
 
@@ -1000,6 +1287,11 @@ class TrayApp:
                 enabled=False,
             ),
             pystray.MenuItem(
+                t("tray.recent", "Recent Results..."),
+                self._on_recent_results_clicked,
+                enabled=self._get_recent_results is not None,
+            ),
+            pystray.MenuItem(
                 t("tray.settings"),
                 self._on_settings_clicked,
             ),
@@ -1027,6 +1319,20 @@ class TrayApp:
         )
         thread.start()
 
+    def _on_recent_results_clicked(
+        self,
+        icon: pystray.Icon,
+        item: pystray.MenuItem,
+    ) -> None:
+        """Open the recent-results dialog on a dedicated thread."""
+        if self._get_recent_results is None:
+            return
+        threading.Thread(
+            target=self._show_recent_results_dialog,
+            name="untype-recent-results-dialog",
+            daemon=True,
+        ).start()
+
     def _on_personas_clicked(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         """Open the persona manager dialog on a dedicated thread."""
         threading.Thread(
@@ -1044,6 +1350,21 @@ class TrayApp:
             dialog.show()
         except Exception:
             logger.exception("Failed to open persona manager dialog")
+
+    def _show_recent_results_dialog(self) -> None:
+        """Create and show the recent-results dialog."""
+        try:
+            if self._get_recent_results is None:
+                return
+            dialog = RecentResultsDialog(
+                get_entries=self._get_recent_results,
+                on_copy=self._on_recent_copy,
+                on_inject=self._on_recent_inject,
+                on_edit=self._on_recent_edit,
+            )
+            dialog.show()
+        except Exception:
+            logger.exception("Failed to open recent-results dialog")
 
     def _show_settings_dialog(self) -> None:
         """Create and show the settings dialog (runs on its own thread)."""

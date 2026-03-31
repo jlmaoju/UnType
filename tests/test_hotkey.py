@@ -22,6 +22,26 @@ def test_parse_hotkey_normalizes_win_alias() -> None:
 
 
 @pytest.mark.parametrize(
+    ("hotkey", "expected_char"),
+    [
+        ("alt+minus", "-"),
+        ("alt+subtract", "-"),
+        ("ctrl+equal", "="),
+        ("shift+bracketleft", "["),
+    ],
+)
+def test_parse_hotkey_accepts_named_punctuation_aliases(
+    hotkey: str,
+    expected_char: str,
+) -> None:
+    modifiers, trigger = parse_hotkey(hotkey)
+
+    assert isinstance(trigger, keyboard.KeyCode)
+    assert trigger.char == expected_char
+    assert modifiers
+
+
+@pytest.mark.parametrize(
     "hotkey",
     [
         "",

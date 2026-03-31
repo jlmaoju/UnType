@@ -8,13 +8,15 @@ import logging.handlers
 import os
 import threading
 import time
+from dataclasses import replace
+from datetime import datetime
 
 import numpy as np
 import pyperclip
 
 from untype.audio import AudioRecorder, normalize_audio
 from untype.build_info import HAS_LOCAL_STT
-from untype.clipboard import grab_selected_text, inject_text, release_all_modifiers
+from untype.clipboard import grab_selected_text, inject_text, release_all_modifiers, save_clipboard
 from untype.config import AppConfig, Persona, load_config, load_personas, save_config
 from untype.hotkey import HotkeyListener
 from untype.i18n import init_language, set_language
@@ -28,12 +30,15 @@ from untype.platform import (
 )
 from untype.stt import STTApiEngine, STTEngine, STTRealtimeApiEngine
 from untype.tray import TrayApp
+from untype.recent_results import RecentResultEntry
 
 logger = logging.getLogger(__name__)
 
 _CONFIG_SAVE_DEBOUNCE_S = 0.25
 _CAPTURE_CLEANUP_TIMEOUT_S = 2.0
 _REALTIME_STOP_TIMEOUT_S = 3.0
+_MAX_RECORDING_PERSONAS = 4
+_RECENT_RESULTS_LIMIT = 10
 
 
 class UnTypeApp:
@@ -73,6 +78,7 @@ class UnTypeApp:
         self._target_window: WindowIdentity | None = None
         self._held_result: str | None = None
         self._held_clipboard: str | None = None
+        self._held_recent_result_id: str | None = None
         self._window_mismatch: bool = False
         self._hwnd_watch_active: bool = False
         self._caret_x: int = 0
@@ -104,6 +110,10 @@ class UnTypeApp:
         self._last_caret_x: int = 0
         self._last_caret_y: int = 0
 
+        # -- Recent results --------------------------------------------------
+        self._recent_results_lock = threading.Lock()
+        self._recent_results: list[RecentResultEntry] = []
+
         # -- Config persistence -----------------------------------------------
         self._config_save_lock = threading.Lock()
         self._config_save_timer: threading.Timer | None = None
@@ -120,6 +130,10 @@ class UnTypeApp:
             on_quit=self._on_quit,
             on_personas_changed=self._on_personas_changed,
             on_rerun_wizard=self._on_rerun_wizard,
+            get_recent_results=self._get_recent_results,
+            on_recent_copy=self._copy_recent_result,
+            on_recent_inject=self._inject_recent_result,
+            on_recent_edit=self._edit_recent_result,
         )
 
         # STT configuration self-check (after tray is ready)
@@ -171,6 +185,13 @@ class UnTypeApp:
     def _active_personas(self) -> list[Persona]:
         """Return only active personas (shown during recording)."""
         return [p for p in self._personas if p.active]
+
+    @property
+    def _recording_personas(self) -> list[Persona]:
+        """Return the smaller recording-time persona subset shown in the quick bar."""
+        active = self._active_personas
+        quick = [p for p in active if p.quick]
+        return (quick or active)[:_MAX_RECORDING_PERSONAS]
 
     def _start_daemon_thread(self, target, name: str) -> None:
         """Start a daemon thread with consistent naming convention.
@@ -388,8 +409,8 @@ class UnTypeApp:
 
             # Show recording persona bar (if personas configured).
             self._preselected_persona = None
-            if self._active_personas:
-                persona_tuples = [(p.id, p.icon, p.name) for p in self._active_personas]
+            if self._recording_personas:
+                persona_tuples = [(p.id, p.icon, p.name) for p in self._recording_personas]
                 self._overlay.show_recording_personas(
                     persona_tuples,
                     self._caret_x,
@@ -401,7 +422,7 @@ class UnTypeApp:
                 # Auto-select the remembered persona (if any and exists)
                 last_id = self._config.last_selected_persona
                 if last_id:
-                    for idx, p in enumerate(self._active_personas):
+                    for idx, p in enumerate(self._recording_personas):
                         if p.id == last_id:
                             self._preselected_persona = p
                             self._overlay.select_recording_persona(idx)
@@ -943,11 +964,25 @@ class UnTypeApp:
         result: str,
         *,
         persona: Persona | None = None,
+        recent_result_id: str | None = None,
+        record_recent: bool = True,
     ) -> None:
         """Persist *result* for the hold bubble instead of injecting it now."""
         self._save_interaction_state(raw_text, result, persona=persona, show_ghost=False)
         self._held_result = result
         self._held_clipboard = self._original_clipboard
+        if recent_result_id is not None:
+            self._held_recent_result_id = recent_result_id
+            self._update_recent_result_status(recent_result_id, "held")
+        elif record_recent:
+            self._held_recent_result_id = self._record_recent_result(
+                raw_text,
+                result,
+                persona=persona,
+                status="held",
+            )
+        else:
+            self._held_recent_result_id = None
         self._overlay.fly_to_hold_bubble(result)
         self._tray.update_status("Ready")
 
@@ -957,22 +992,48 @@ class UnTypeApp:
         result: str,
         *,
         persona: Persona | None = None,
+        recent_result_id: str | None = None,
+        record_recent: bool = True,
     ) -> bool:
         """Inject *result* or divert it to the hold bubble when unsafe."""
         if not self._verify_window_safety():
             logger.warning("Window changed before injection - holding result")
-            self._hold_result_for_later(raw_text, result, persona=persona)
+            self._hold_result_for_later(
+                raw_text,
+                result,
+                persona=persona,
+                recent_result_id=recent_result_id,
+                record_recent=record_recent,
+            )
             return False
 
         injection = inject_text(result, self._original_clipboard)
         if not injection:
             logger.warning(
-                "Text injection failed (clipboard=%s, paste=%s) - holding result",
+                "Text injection failed (method=%s, typed=%d, clipboard=%s, paste=%s) - holding result",
+                injection.delivery_method,
+                injection.typed_characters,
                 injection.copied_to_clipboard,
                 injection.paste_simulated,
             )
-            self._hold_result_for_later(raw_text, result, persona=persona)
+            self._hold_result_for_later(
+                raw_text,
+                result,
+                persona=persona,
+                recent_result_id=recent_result_id,
+                record_recent=record_recent,
+            )
             return False
+
+        if recent_result_id is not None:
+            self._update_recent_result_status(recent_result_id, "injected")
+        elif record_recent:
+            self._record_recent_result(
+                raw_text,
+                result,
+                persona=persona,
+                status="injected",
+            )
 
         self._save_interaction_state(raw_text, result, persona=persona)
         self._overlay.hide()
@@ -983,26 +1044,34 @@ class UnTypeApp:
     # Hold callbacks (Phase 2 — called from overlay thread)
     # ------------------------------------------------------------------
 
-    def _take_held_result(self, *, hide_bubble: bool = False) -> tuple[str | None, str | None]:
+    def _take_held_result(
+        self,
+        *,
+        hide_bubble: bool = False,
+    ) -> tuple[str | None, str | None, str | None]:
         """Consume and clear the currently held result."""
         result = self._held_result
         clipboard = self._held_clipboard
+        recent_result_id = self._held_recent_result_id
         self._held_result = None
         self._held_clipboard = None
+        self._held_recent_result_id = None
         if hide_bubble:
             self._overlay.hide_hold_bubble()
-        return result, clipboard
+        return result, clipboard, recent_result_id
 
     def _restore_held_result(
         self,
         result: str | None,
         clipboard: str | None,
+        recent_result_id: str | None = None,
         *,
         show_bubble: bool = False,
     ) -> None:
         """Restore a held result after a failed retry path."""
         self._held_result = result
         self._held_clipboard = clipboard
+        self._held_recent_result_id = recent_result_id
         if show_bubble and result is not None:
             self._overlay.fly_to_hold_bubble(result)
 
@@ -1015,7 +1084,7 @@ class UnTypeApp:
 
     def _on_hold_inject(self) -> None:
         """Left-click on hold bubble — inject into the current foreground window."""
-        result, clipboard = self._take_held_result()
+        result, clipboard, recent_result_id = self._take_held_result()
 
         if result is None:
             return
@@ -1024,12 +1093,22 @@ class UnTypeApp:
         injection = inject_text(result, clipboard)
         if not injection:
             logger.warning(
-                "Hold-inject failed (clipboard=%s, paste=%s) - restoring hold bubble",
+                "Hold-inject failed (method=%s, typed=%d, clipboard=%s, paste=%s) - restoring hold bubble",
+                injection.delivery_method,
+                injection.typed_characters,
                 injection.copied_to_clipboard,
                 injection.paste_simulated,
             )
-            self._restore_held_result(result, clipboard, show_bubble=True)
+            self._restore_held_result(
+                result,
+                clipboard,
+                recent_result_id,
+                show_bubble=True,
+            )
             return
+
+        if recent_result_id is not None:
+            self._update_recent_result_status(recent_result_id, "injected")
 
         # Show ghost menu if we have saved interaction state.
         if self._last_raw_text is not None:
@@ -1038,7 +1117,7 @@ class UnTypeApp:
 
     def _on_hold_copy(self) -> None:
         """Right-click on hold bubble — copy held text to clipboard."""
-        result, _clipboard = self._take_held_result()
+        result, _clipboard, recent_result_id = self._take_held_result()
 
         if result is None:
             return
@@ -1046,6 +1125,8 @@ class UnTypeApp:
         logger.info("Hold-copy: copying %d chars to clipboard", len(result))
         try:
             pyperclip.copy(result)
+            if recent_result_id is not None:
+                self._update_recent_result_status(recent_result_id, "copied")
         except Exception:
             logger.exception("Failed to copy held result to clipboard")
 
@@ -1129,6 +1210,155 @@ class UnTypeApp:
         if not self._active_personas:
             return None
         return [(p.id, p.icon, p.name) for p in self._active_personas]
+
+    def _record_recent_result(
+        self,
+        raw_text: str,
+        result: str,
+        *,
+        persona: Persona | None,
+        status: str,
+    ) -> str:
+        """Add a new recent result entry and keep the session history bounded."""
+        target = self._target_window
+        entry = RecentResultEntry(
+            id=f"recent-{time.time_ns()}",
+            created_at=datetime.now(),
+            raw_text=raw_text,
+            result_text=result,
+            mode=self._mode,
+            status=status,
+            window_title=(target.title.strip() if target is not None else ""),
+            persona_id=persona.id if persona is not None else None,
+            persona_name=persona.name if persona is not None else None,
+            persona_icon=persona.icon if persona is not None else None,
+        )
+        with self._recent_results_lock:
+            self._recent_results.insert(0, entry)
+            del self._recent_results[_RECENT_RESULTS_LIMIT:]
+        return entry.id
+
+    def _update_recent_result_status(self, entry_id: str | None, status: str) -> None:
+        """Update the delivery status for an existing recent-result entry."""
+        if entry_id is None:
+            return
+        with self._recent_results_lock:
+            for index, entry in enumerate(self._recent_results):
+                if entry.id == entry_id:
+                    self._recent_results[index] = replace(entry, status=status)
+                    return
+
+    def _get_recent_results(self) -> list[RecentResultEntry]:
+        """Return a snapshot of recent results for the tray dialog."""
+        with self._recent_results_lock:
+            return list(self._recent_results)
+
+    def _find_recent_result(self, entry_id: str) -> RecentResultEntry | None:
+        """Look up a recent result by id."""
+        with self._recent_results_lock:
+            for entry in self._recent_results:
+                if entry.id == entry_id:
+                    return entry
+        return None
+
+    def _prepare_foreground_delivery_context(self, *, mode: str = "insert") -> None:
+        """Capture the current foreground target for a manual delivery action."""
+        self._mode = mode
+        self._selected_text = None
+        self._original_clipboard = save_clipboard()
+        time.sleep(0.05)
+        target = get_foreground_window()
+        self._target_window = target if target.hwnd else None
+        caret = get_caret_screen_position()
+        self._caret_x = caret.x
+        self._caret_y = caret.y
+        self._window_mismatch = False
+
+    def _copy_recent_result(self, entry_id: str) -> bool:
+        """Copy a recent result back to the clipboard."""
+        entry = self._find_recent_result(entry_id)
+        if entry is None:
+            return False
+
+        try:
+            pyperclip.copy(entry.result_text)
+        except Exception:
+            logger.exception("Recent result copy failed")
+            return False
+
+        if entry.status == "held":
+            self._update_recent_result_status(entry_id, "copied")
+        return True
+
+    def _inject_recent_result(self, entry_id: str) -> bool:
+        """Reinject a recent result into the current foreground window."""
+        entry = self._find_recent_result(entry_id)
+        if entry is None:
+            return False
+        if not self._try_acquire_pipeline_action("Recent inject"):
+            return False
+
+        try:
+            self._prepare_foreground_delivery_context()
+            return self._deliver_result(
+                entry.result_text,
+                entry.result_text,
+                recent_result_id=entry_id,
+                record_recent=False,
+            )
+        finally:
+            self._reset_pipeline_runtime_state()
+
+    def _edit_recent_result(self, entry_id: str) -> bool:
+        """Open a recent result in staging for manual revision and reinjection."""
+        entry = self._find_recent_result(entry_id)
+        if entry is None:
+            return False
+        if not self._try_acquire_pipeline_action("Recent edit"):
+            return False
+
+        try:
+            self._prepare_foreground_delivery_context()
+            self._tray.update_status("Ready")
+            self._overlay.show_staging(
+                entry.result_text,
+                self._caret_x,
+                self._caret_y,
+                personas=self._get_active_persona_staging_options(),
+            )
+            edited_text, action = self._overlay.wait_staging()
+
+            if action == "cancel":
+                logger.info("Recent edit staging: cancelled")
+                return True
+
+            time.sleep(0.15)
+
+            persona = None
+            if action.startswith("persona:"):
+                pid = action.split(":", 1)[1]
+                persona = next((p for p in self._personas if p.id == pid), None)
+                action = "refine"
+
+            if action == "raw":
+                return self._deliver_result(entry.result_text, edited_text, persona=persona)
+
+            result = self._run_llm_with_watch(
+                edited_text,
+                persona=persona,
+                cancel_before_message="Recent edit: cancelled before LLM call",
+                cancel_during_message="Recent edit: LLM cancelled by user",
+                cancel_after_message="Recent edit: cancelled after LLM returned",
+                error_message="Recent edit LLM error",
+            )
+            if result is None:
+                return True
+
+            self._hwnd_watch_active = False
+            return self._deliver_result(entry.result_text, result, persona=persona)
+        finally:
+            self._reset_pipeline_runtime_state()
+            self._tray.update_status("Ready")
 
     def _simulate_undo(self) -> None:
         """Send Ctrl+Z to undo the last paste in the target app."""
@@ -1285,8 +1515,8 @@ class UnTypeApp:
     def _on_digit_during_recording(self, digit: int) -> None:
         """Called from the keyboard hook thread when a digit key is pressed."""
         idx = digit - 1
-        if idx < len(self._active_personas):
-            active_persona = self._active_personas[idx]
+        if idx < len(self._recording_personas):
+            active_persona = self._recording_personas[idx]
             if self._preselected_persona == active_persona:
                 # Toggle off: pressing the same digit again deselects.
                 self._preselected_persona = None

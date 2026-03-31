@@ -4,7 +4,7 @@ import threading
 from types import SimpleNamespace
 
 from untype.clipboard import InjectionResult
-from untype.config import AppConfig
+from untype.config import AppConfig, Persona
 from untype.main import UnTypeApp
 
 
@@ -72,6 +72,15 @@ def _make_app() -> tuple[UnTypeApp, list[tuple[str, str, object | None, bool]]]:
     app._original_clipboard = "original"
     app._held_result = None
     app._held_clipboard = None
+    app._held_recent_result_id = None
+    app._recent_results_lock = threading.Lock()
+    app._recent_results = []
+    app._mode = "insert"
+    app._target_window = None
+    app._window_mismatch = False
+    app._caret_x = 0
+    app._caret_y = 0
+    app._personas = []
     saved: list[tuple[str, str, object | None, bool]] = []
 
     def fake_save(raw_text: str, result: str, persona=None, show_ghost: bool = True) -> None:
@@ -97,6 +106,8 @@ def test_deliver_result_saves_and_hides_on_success(monkeypatch) -> None:
 
     assert delivered is True
     assert saved == [("raw", "clean", None, True)]
+    assert len(app._recent_results) == 1
+    assert app._recent_results[0].status == "injected"
     assert app._overlay.hidden is True
     assert app._overlay.held == []
     assert app._tray.statuses == ["Ready"]
@@ -124,6 +135,8 @@ def test_deliver_result_holds_when_window_is_unsafe(monkeypatch) -> None:
     assert saved == [("raw", "clean", None, False)]
     assert app._held_result == "clean"
     assert app._held_clipboard == "original"
+    assert app._held_recent_result_id == app._recent_results[0].id
+    assert app._recent_results[0].status == "held"
     assert app._overlay.held == ["clean"]
     assert app._tray.statuses == ["Ready"]
 
@@ -132,23 +145,27 @@ def test_take_held_result_clears_state_and_can_hide_bubble() -> None:
     app, _saved = _make_app()
     app._held_result = "held"
     app._held_clipboard = "clip"
+    app._held_recent_result_id = "recent-1"
 
-    result, clipboard = app._take_held_result(hide_bubble=True)
+    result, clipboard, recent_result_id = app._take_held_result(hide_bubble=True)
 
     assert result == "held"
     assert clipboard == "clip"
+    assert recent_result_id == "recent-1"
     assert app._held_result is None
     assert app._held_clipboard is None
+    assert app._held_recent_result_id is None
     assert app._overlay.hold_bubble_hidden is True
 
 
 def test_restore_held_result_reinstates_bubble_state() -> None:
     app, _saved = _make_app()
 
-    app._restore_held_result("held", "clip", show_bubble=True)
+    app._restore_held_result("held", "clip", "recent-1", show_bubble=True)
 
     assert app._held_result == "held"
     assert app._held_clipboard == "clip"
+    assert app._held_recent_result_id == "recent-1"
     assert app._overlay.held == ["held"]
 
 
@@ -430,5 +447,27 @@ def test_deliver_result_holds_when_injection_fails(monkeypatch) -> None:
     assert saved == [("raw", "clean", None, False)]
     assert app._held_result == "clean"
     assert app._held_clipboard == "original"
+    assert app._recent_results[0].status == "held"
     assert app._overlay.held == ["clean"]
     assert app._tray.statuses == ["Ready"]
+
+
+def test_recording_personas_prefers_quick_subset() -> None:
+    app, _saved = _make_app()
+    app._personas = [
+        Persona(id="a", name="A", icon="A", active=True, quick=False),
+        Persona(id="b", name="B", icon="B", active=True, quick=True),
+        Persona(id="c", name="C", icon="C", active=True, quick=True),
+    ]
+
+    assert [persona.id for persona in app._recording_personas] == ["b", "c"]
+
+
+def test_recording_personas_falls_back_to_first_four_active() -> None:
+    app, _saved = _make_app()
+    app._personas = [
+        Persona(id=f"p{i}", name=f"P{i}", icon=str(i), active=True)
+        for i in range(1, 6)
+    ]
+
+    assert [persona.id for persona in app._recording_personas] == ["p1", "p2", "p3", "p4"]

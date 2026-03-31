@@ -25,6 +25,8 @@ def test_dict_to_config_clamps_and_sanitizes_values() -> None:
             "audio": {"gain_boost": 20.0, "sample_rate": 999999},
             "stt": {"backend": "bad-backend", "api_base_url": "not-a-url"},
             "llm": {"base_url": "also-bad", "temperature": 5.0},
+            "language": "en",
+            "last_selected_persona": "coach",
         }
     )
 
@@ -34,6 +36,8 @@ def test_dict_to_config_clamps_and_sanitizes_values() -> None:
     assert config.stt.api_base_url == ""
     assert config.llm.base_url == ""
     assert config.llm.temperature == 2.0
+    assert config.language == "en"
+    assert config.last_selected_persona == "coach"
 
 
 def test_load_personas_skips_invalid_entries(monkeypatch, tmp_path: Path) -> None:
@@ -94,11 +98,13 @@ def test_save_and_delete_persona_round_trip(monkeypatch, tmp_path: Path) -> None
     personas_dir = tmp_path / "personas"
     monkeypatch.setattr(config_module, "get_personas_dir", lambda: personas_dir)
 
-    persona = config_module.Persona(id="demo", name="Demo", icon="*")
+    persona = config_module.Persona(id="demo", name="Demo", icon="*", quick=True)
 
     config_module.save_persona(persona)
 
     assert (personas_dir / "demo.json").exists()
-    assert [loaded.id for loaded in config_module.load_personas()] == ["demo"]
+    loaded = config_module.load_personas()
+    assert [persona.id for persona in loaded] == ["demo"]
+    assert loaded[0].quick is True
     assert config_module.delete_persona("demo") is True
     assert config_module.delete_persona("demo") is False

@@ -57,6 +57,22 @@ _SPECIAL_KEYS: dict[str, keyboard.Key] = {
     "f12": keyboard.Key.f12,
 }
 
+_CHAR_KEY_ALIASES: dict[str, str] = {
+    "minus": "-",
+    "subtract": "-",
+    "kp_subtract": "-",
+    "equal": "=",
+    "comma": ",",
+    "period": ".",
+    "slash": "/",
+    "backslash": "\\",
+    "semicolon": ";",
+    "apostrophe": "'",
+    "grave": "`",
+    "bracketleft": "[",
+    "bracketright": "]",
+}
+
 
 def parse_hotkey(hotkey_str: str) -> tuple[set[str], keyboard.KeyCode | keyboard.Key]:
     """Parse a hotkey string like "alt+space" into (modifier_names, trigger_key).
@@ -93,6 +109,7 @@ def parse_hotkey(hotkey_str: str) -> tuple[set[str], keyboard.KeyCode | keyboard
 
     # Resolve trigger key
     trigger: keyboard.KeyCode | keyboard.Key
+    trigger_part = _CHAR_KEY_ALIASES.get(trigger_part, trigger_part)
     if trigger_part in _SPECIAL_KEYS:
         trigger = _SPECIAL_KEYS[trigger_part]
     elif trigger_part in _MODIFIER_MAP or trigger_part == "win":

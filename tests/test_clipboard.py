@@ -1,69 +1,63 @@
 from __future__ import annotations
 
+import ctypes
+import sys
+
 from untype import clipboard
 
 
-def test_inject_text_reports_success_and_restores_clipboard(monkeypatch) -> None:
+def test_inject_text_types_text_without_using_clipboard(monkeypatch) -> None:
+    typed: list[str] = []
     copied: list[str] = []
-    simulated: list[tuple[object, str]] = []
     restored: list[str | None] = []
 
+    monkeypatch.setattr(
+        clipboard,
+        "_type_text_into_foreground",
+        lambda text: typed.append(text) or len(text),
+    )
     monkeypatch.setattr(clipboard.pyperclip, "copy", lambda text: copied.append(text))
-    monkeypatch.setattr(
-        clipboard,
-        "_simulate_hotkey",
-        lambda key, char: simulated.append((key, char)),
-    )
-    monkeypatch.setattr(clipboard, "get_modifier_key", lambda: "ctrl")
     monkeypatch.setattr(clipboard, "restore_clipboard", lambda text: restored.append(text))
     monkeypatch.setattr(clipboard.time, "sleep", lambda _seconds: None)
 
     result = clipboard.inject_text("hello", "original")
 
-    assert result.copied_to_clipboard is True
-    assert result.paste_simulated is True
-    assert bool(result) is True
-    assert copied == ["hello"]
-    assert simulated == [("ctrl", "v")]
-    assert restored == ["original"]
-
-
-def test_inject_text_reports_paste_failure_and_restores_clipboard(monkeypatch) -> None:
-    restored: list[str | None] = []
-
-    monkeypatch.setattr(clipboard.pyperclip, "copy", lambda text: None)
-    monkeypatch.setattr(clipboard, "get_modifier_key", lambda: "ctrl")
-    monkeypatch.setattr(
-        clipboard,
-        "_simulate_hotkey",
-        lambda key, char: (_ for _ in ()).throw(RuntimeError("paste failed")),
-    )
-    monkeypatch.setattr(clipboard, "restore_clipboard", lambda text: restored.append(text))
-    monkeypatch.setattr(clipboard.time, "sleep", lambda _seconds: None)
-
-    result = clipboard.inject_text("hello", "original")
-
-    assert result.copied_to_clipboard is True
+    assert result.delivery_method == "typed"
+    assert result.typed_characters == 5
+    assert result.copied_to_clipboard is False
     assert result.paste_simulated is False
-    assert bool(result) is False
-    assert restored == ["original"]
+    assert bool(result) is True
+    assert typed == ["hello"]
+    assert copied == []
+    assert restored == []
 
 
-def test_inject_text_reports_copy_failure(monkeypatch) -> None:
-    restored: list[str | None] = []
-
-    def fail_copy(text: str) -> None:
-        raise clipboard.pyperclip.PyperclipException("copy failed")
-
-    monkeypatch.setattr(clipboard.pyperclip, "copy", fail_copy)
-    monkeypatch.setattr(clipboard, "restore_clipboard", lambda text: restored.append(text))
+def test_inject_text_reports_typing_failure(monkeypatch) -> None:
+    monkeypatch.setattr(clipboard, "_type_text_into_foreground", lambda text: len(text) - 1)
 
     result = clipboard.inject_text("hello", "original")
 
+    assert result.delivery_method == "typed"
+    assert result.typed_characters == 4
     assert result.copied_to_clipboard is False
     assert result.paste_simulated is False
     assert bool(result) is False
-    assert restored == ["original"]
+
+
+def test_inject_text_treats_empty_string_as_success(monkeypatch) -> None:
+    typed: list[str] = []
+    monkeypatch.setattr(
+        clipboard,
+        "_type_text_into_foreground",
+        lambda text: typed.append(text) or 0,
+    )
+
+    result = clipboard.inject_text("", "original")
+
+    assert result.delivery_method == "typed"
+    assert result.typed_characters == 0
+    assert bool(result) is True
+    assert typed == []
 
 
 def test_grab_selected_text_polls_until_clipboard_updates(monkeypatch) -> None:
@@ -95,3 +89,26 @@ def test_simulate_hotkey_with_retry_retries_once(monkeypatch) -> None:
 
     assert clipboard._simulate_hotkey_with_retry("ctrl", "v") is True
     assert attempts == [("ctrl", "v"), ("ctrl", "v")]
+
+
+def test_type_text_into_foreground_types_each_character(monkeypatch) -> None:
+    chars: list[str] = []
+
+    monkeypatch.setattr(clipboard, "_type_character", lambda char: chars.append(char) or True)
+    monkeypatch.setattr(clipboard.time, "sleep", lambda _seconds: None)
+
+    typed = clipboard._type_text_into_foreground("ab")
+
+    assert typed == 2
+    assert chars == ["a", "b"]
+
+
+def test_iter_utf16_code_units_supports_surrogate_pairs() -> None:
+    assert clipboard._iter_utf16_code_units("🙂") == [0xD83D, 0xDE42]
+
+
+def test_win32_input_structure_matches_sendinput_expectations() -> None:
+    if sys.platform != "win32":
+        return
+
+    assert ctypes.sizeof(clipboard._INPUT) == 40

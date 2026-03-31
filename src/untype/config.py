@@ -133,6 +133,7 @@ class Persona:
     name: str
     icon: str  # emoji, e.g. "📚"
     active: bool = True  # whether this persona is shown during recording
+    quick: bool = False  # whether this persona is shown in the recording quick bar
     prompt_polish: str = ""  # system prompt for polish mode (empty = use global)
     prompt_insert: str = ""  # system prompt for insert mode (empty = use global)
     model: str = ""  # override LLM model (empty = use global)
@@ -251,7 +252,23 @@ def _dict_to_config(data: dict) -> AppConfig:
         )
         audio.sample_rate = _clamp_int(audio.sample_rate, 8000, 48000)
 
-    return AppConfig(hotkey=hotkey, overlay=overlay, audio=audio, stt=stt, llm=llm)
+    language = data.get("language", "zh")
+    if not isinstance(language, str) or not language:
+        language = "zh"
+
+    last_selected_persona = data.get("last_selected_persona", "default")
+    if not isinstance(last_selected_persona, str) or not last_selected_persona:
+        last_selected_persona = "default"
+
+    return AppConfig(
+        hotkey=hotkey,
+        overlay=overlay,
+        audio=audio,
+        stt=stt,
+        llm=llm,
+        language=language,
+        last_selected_persona=last_selected_persona,
+    )
 
 
 def _config_to_dict(config: AppConfig) -> dict:
